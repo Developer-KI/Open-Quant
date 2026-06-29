@@ -1,7 +1,6 @@
 """Reusable Plotly chart builders for the trading dashboard."""
 from __future__ import annotations
 
-import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import plotly.subplots as sp
@@ -16,11 +15,18 @@ _CYAN = "#00BCD4"
 
 _OVERLAY_COLORS = [_BLUE, _ORANGE, _PURPLE, _CYAN, "#4CAF50", "#F44336"]
 
+# Shared style constants matching the dashboard terminal aesthetic
+_GRID = dict(showgrid=True, gridwidth=1, gridcolor="rgba(255,255,255,0.1)")
+_LEGEND_H = dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+_MARGIN_MAIN = dict(l=50, r=20, t=50, b=20)
+_MARGIN_MINI = dict(l=50, r=20, t=10, b=20)
+
 
 def candlestick_chart(
     df: pd.DataFrame,
     overlays: dict[str, pd.Series] | None = None,
     title: str = "",
+    height: int = 500,
 ) -> go.Figure:
     """
     OHLCV candlestick with optional indicator overlays.
@@ -44,10 +50,13 @@ def candlestick_chart(
         title=title,
         xaxis_rangeslider_visible=False,
         template=_DARK,
-        height=500,
-        margin=dict(l=40, r=40, t=40, b=20),
-        legend=dict(orientation="h", y=1.02),
+        height=height,
+        hovermode="x unified",
+        margin=_MARGIN_MAIN,
+        legend=_LEGEND_H,
     )
+    fig.update_xaxes(**_GRID)
+    fig.update_yaxes(**_GRID)
     return fig
 
 
@@ -70,10 +79,13 @@ def volume_bars(df: pd.DataFrame) -> go.Figure:
     fig = go.Figure(go.Bar(x=df.index, y=df["volume"], marker_color=colors, name="Volume"))
     fig.update_layout(
         template=_DARK, height=150,
-        margin=dict(l=40, r=40, t=10, b=20),
+        hovermode="x unified",
+        margin=_MARGIN_MINI,
         showlegend=False,
         yaxis_title="Volume",
     )
+    fig.update_xaxes(**_GRID)
+    fig.update_yaxes(**_GRID)
     return fig
 
 
@@ -91,10 +103,13 @@ def rsi_chart(series: pd.Series, period: int = 14) -> go.Figure:
     ))
     fig.update_layout(
         template=_DARK, height=150,
+        hovermode="x unified",
         yaxis=dict(range=[0, 100]),
-        margin=dict(l=40, r=40, t=10, b=20),
+        margin=_MARGIN_MINI,
         showlegend=False,
     )
+    fig.update_xaxes(**_GRID)
+    fig.update_yaxes(**_GRID)
     return fig
 
 
@@ -107,9 +122,12 @@ def atr_chart(series: pd.Series, period: int = 14) -> go.Figure:
     ))
     fig.update_layout(
         template=_DARK, height=150,
-        margin=dict(l=40, r=40, t=10, b=20),
+        hovermode="x unified",
+        margin=_MARGIN_MINI,
         showlegend=False,
     )
+    fig.update_xaxes(**_GRID)
+    fig.update_yaxes(**_GRID)
     return fig
 
 
@@ -131,11 +149,14 @@ def equity_chart(equity_curve: pd.Series, drawdown: pd.Series) -> go.Figure:
     ), row=2, col=1)
     fig.update_layout(
         template=_DARK, height=460,
-        margin=dict(l=40, r=40, t=20, b=20),
-        legend=dict(orientation="h", y=1.02),
+        hovermode="x unified",
+        margin=_MARGIN_MAIN,
+        legend=_LEGEND_H,
     )
     fig.update_yaxes(title_text="Equity ($)", row=1, col=1)
     fig.update_yaxes(title_text="DD (%)", row=2, col=1)
+    fig.update_xaxes(**_GRID)
+    fig.update_yaxes(**_GRID)
     return fig
 
 
@@ -145,7 +166,6 @@ def trade_markers(fig: go.Figure, trades_df: pd.DataFrame) -> go.Figure:
         return fig
 
     def _to_str(v):
-        # Handle Side enum, "Side.LONG" strings, and plain strings
         s = str(v)
         return s.split(".")[-1] if "." in s else s
 
@@ -198,10 +218,13 @@ def depth_chart(snapshot) -> go.Figure:
         ))
     fig.update_layout(
         template=_DARK, height=350, barmode="overlay",
-        margin=dict(l=40, r=40, t=20, b=20),
+        hovermode="closest",
+        margin=_MARGIN_MAIN,
         xaxis_title="Price", yaxis_title="Size",
-        legend=dict(orientation="h"),
+        legend=_LEGEND_H,
     )
+    fig.update_xaxes(**_GRID)
+    fig.update_yaxes(**_GRID)
     return fig
 
 
@@ -227,11 +250,14 @@ def funding_chart(df: pd.DataFrame) -> go.Figure:
 
     fig.update_layout(
         template=_DARK, height=420,
-        margin=dict(l=40, r=40, t=20, b=20),
-        legend=dict(orientation="h"),
+        hovermode="x unified",
+        margin=_MARGIN_MAIN,
+        legend=_LEGEND_H,
     )
     fig.update_yaxes(title_text="Funding (bps)", row=1, col=1)
     fig.update_yaxes(title_text="Price ($)", row=2, col=1)
+    fig.update_xaxes(**_GRID)
+    fig.update_yaxes(**_GRID)
     return fig
 
 
@@ -264,26 +290,38 @@ def sentiment_scatter(df: pd.DataFrame) -> go.Figure:
     fig.add_hline(y=0, line_dash="dash", line_color="gray", opacity=0.5)
     fig.update_layout(
         template=_DARK, height=300,
-        margin=dict(l=40, r=40, t=20, b=20),
+        hovermode="closest",
+        margin=_MARGIN_MAIN,
         xaxis_title="Time", yaxis_title="Sentiment Score",
-        legend=dict(orientation="h"),
+        legend=_LEGEND_H,
     )
+    fig.update_xaxes(**_GRID)
+    fig.update_yaxes(**_GRID)
     return fig
 
 
-def spread_chart(timestamps: list, spread_bps: list) -> go.Figure:
-    """Bid-ask spread (bps) time series — used as a subplot below the price chart."""
+def spread_chart(
+    timestamps: list,
+    spread_bps: list,
+    title: str = "",
+    height: int = 150,
+) -> go.Figure:
+    """Bid-ask spread (bps) time series."""
     fig = go.Figure(go.Scatter(
         x=timestamps, y=spread_bps,
         name="Spread (bps)", line=dict(color=_CYAN, width=1),
         fill="tozeroy", fillcolor="rgba(0,188,212,0.10)",
     ))
     fig.update_layout(
-        template=_DARK, height=150,
-        margin=dict(l=40, r=40, t=10, b=20),
+        template=_DARK, height=height,
+        hovermode="x unified",
+        title=title,
+        margin=_MARGIN_MAIN if title else _MARGIN_MINI,
         yaxis_title="Spread (bps)",
         showlegend=False,
     )
+    fig.update_xaxes(**_GRID)
+    fig.update_yaxes(**_GRID)
     return fig
 
 
@@ -299,10 +337,13 @@ def funding_rate_mini(df: pd.DataFrame) -> go.Figure:
     fig.add_hline(y=0, line_color="gray", line_width=0.5, opacity=0.4)
     fig.update_layout(
         template=_DARK, height=150,
-        margin=dict(l=40, r=40, t=10, b=20),
+        hovermode="x unified",
+        margin=_MARGIN_MINI,
         yaxis_title="Funding (bps)",
         showlegend=False,
     )
+    fig.update_xaxes(**_GRID)
+    fig.update_yaxes(**_GRID)
     return fig
 
 
@@ -319,7 +360,10 @@ def macro_chart(df: pd.DataFrame, col: str, label: str, color: str = _BLUE) -> g
     ))
     fig.update_layout(
         template=_DARK, height=260, title=label,
-        margin=dict(l=40, r=40, t=40, b=20),
+        hovermode="x unified",
+        margin=_MARGIN_MAIN,
         showlegend=False,
     )
+    fig.update_xaxes(**_GRID)
+    fig.update_yaxes(**_GRID)
     return fig

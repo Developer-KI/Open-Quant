@@ -25,6 +25,8 @@ trades_by_symbol) on top of the standard ones.
 from __future__ import annotations
 
 import copy
+import json
+import os
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -39,6 +41,7 @@ from core.models import (
     Side,
     Trade,
 )
+from core.parser import timeframe_to_bars_per_year, TIMEFRAMES
 from backtester.costs import CostModel, CompositeCostModel
 from risk.sizing import Sizer, SizingContext, default_sizer
 from risk.stops import (
@@ -204,6 +207,51 @@ class BacktestResult:
         plt.close(fig)
         return path
 
+    def save(self, run_name: str, base_dir: str = "logs/test") -> str:
+        """Save log.json, trades.csv, equity_curve.png, and signal_log.csv to logs/test/<run_name>/."""
+        import dataclasses
+        from datetime import datetime, timezone
+
+        run_dir = os.path.join(base_dir, run_name)
+        os.makedirs(run_dir, exist_ok=True)
+
+        summary = self.summary()
+        config_dict = dataclasses.asdict(self.config)
+
+        eq = self.equity_curve
+        data_range: dict[str, Any] = {"bars": len(eq)}
+        if isinstance(eq.index, pd.DatetimeIndex) and len(eq) > 0:
+            data_range["start"] = str(eq.index[0])
+            data_range["end"] = str(eq.index[-1])
+
+        meta_out: dict[str, Any] = {}
+        for k, v in self.meta.items():
+            if isinstance(v, (list, tuple)):
+                meta_out[k] = list(v)
+            elif isinstance(v, (int, float, str, bool, type(None))):
+                meta_out[k] = v
+            else:
+                meta_out[k] = str(v)
+
+        log_data = {
+            "run_name": run_name,
+            "saved_at": datetime.now(timezone.utc).isoformat(),
+            "data_range": data_range,
+            "summary": summary,
+            "config": config_dict,
+            "meta": meta_out,
+        }
+        with open(os.path.join(run_dir, "log.json"), "w") as f:
+            json.dump(log_data, f, indent=2, default=str)
+
+        self.to_csv(os.path.join(run_dir, "trades.csv"))
+        self.plot_equity(save_path=os.path.join(run_dir, "equity_curve.png"))
+
+        if self.signal_log is not None and not self.signal_log.empty:
+            self.signal_log.to_csv(os.path.join(run_dir, "signal_log.csv"), index=False)
+
+        return run_dir
+
 
 # ── Per-asset state ──────────────────────────────────────────────────────────
 
@@ -276,13 +324,19 @@ class Backtester:
         data: pd.DataFrame | None = None,
         l2: list[OrderBookSnapshot] | None = None,
         universe: Universe | None = None,
+        timeframe: str | None = None,
         bars_per_year: int | None = None,
     ) -> BacktestResult:
         """
         Run backtest.
 
         Old API:  result = bt.run(data=df, l2=snapshots)
-        New API:  result = bt.run(universe=universe)
+        New API:  result = bt.run(universe=universe, timeframe="1h")
+
+        timeframe     — bar size label (e.g. "1m", "5m", "1h", "1d").
+                        Used to compute bars_per_year for annualisation.
+                        Takes precedence over bars_per_year when both supplied.
+        bars_per_year — explicit override; ignored when timeframe is set.
         """
         # ── Resolve strategy + universe from whatever was provided ────────
 
@@ -318,12 +372,18 @@ class Backtester:
         symbols = universe.symbols
         is_single_asset = len(symbols) == 1
 
+        # timeframe takes precedence over the legacy bars_per_year param
+        resolved_bpy = bars_per_year
+        if timeframe is not None:
+            resolved_bpy = timeframe_to_bars_per_year(timeframe)
+
         return self._run_loop(
             strategy=strategy,
             universe=universe,
             symbols=symbols,
             is_single_asset=is_single_asset,
-            bars_per_year=bars_per_year,
+            bars_per_year=resolved_bpy,
+            timeframe=timeframe,
         )
 
     # ── Core loop ────────────────────────────────────────────────────────
@@ -335,6 +395,7 @@ class Backtester:
         symbols: list[str],
         is_single_asset: bool,
         bars_per_year: int | None,
+        timeframe: str | None = None,
     ) -> BacktestResult:
         t0 = time.perf_counter()
         n_bars = universe.bar_count()
@@ -781,7 +842,9 @@ class Backtester:
         else:
             sig_df = pd.DataFrame(alloc_log_rows) if alloc_log_rows else pd.DataFrame()
 
-        meta = {"bars_per_year": bars_per_year, "symbols": symbols}
+        meta: dict[str, Any] = {"bars_per_year": bars_per_year, "symbols": symbols}
+        if timeframe is not None:
+            meta["timeframe"] = timeframe
 
         return BacktestResult(
             trades=final_trades,

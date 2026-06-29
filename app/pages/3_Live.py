@@ -9,12 +9,14 @@ for _p in [str(_ROOT / "src"), str(_ROOT), str(_ROOT / "app")]:
         sys.path.insert(0, _p)
 
 import pandas as pd
-import plotly.graph_objects as go
 import streamlit as st
 
+from components.charts import candlestick_chart
 from components.forms import signal_form, sizer_form, stop_form
+from components.style import inject
 
 st.set_page_config(page_title="Live Trading", page_icon="🚀", layout="wide")
+inject()
 st.title("Live Trading")
 
 # ── Session state guards ──────────────────────────────────────────────────────
@@ -67,8 +69,9 @@ with col_cfg:
 
     # Market
     symbol = st.text_input("Symbol", value="ETH", key="live_sym", disabled=disabled).upper()
-    bar_interval = st.number_input("Bar interval (seconds)", value=60, step=10,
-                                    min_value=5, key="live_bar_int", disabled=disabled)
+    from core.parser import TIMEFRAMES, timeframe_to_seconds
+    live_timeframe = st.selectbox("Bar timeframe", TIMEFRAMES, index=0,
+                                   key="live_tf", disabled=disabled)
     warmup_bars = st.number_input("Warm-up bars", value=200, step=10,
                                    min_value=10, key="live_warmup", disabled=disabled)
 
@@ -139,7 +142,7 @@ if start_pressed and live_signal_cls is not None:
             api_secret=api_secret,
             use_testnet=use_testnet,
             symbol=symbol,
-            bar_interval_s=int(bar_interval),
+            bar_interval_s=timeframe_to_seconds(live_timeframe),
             warmup_bars=int(warmup_bars),
             risk_per_trade=risk_per_trade,
             max_position_pct=max_pos_pct,
@@ -230,19 +233,10 @@ with col_dash:
                     live_df = ast.bar_builder.to_dataframe()
                     if not live_df.empty:
                         live_view = live_df.tail(100)
-                        fig_live = go.Figure(go.Candlestick(
-                            x=live_view.index,
-                            open=live_view["open"], high=live_view["high"],
-                            low=live_view["low"], close=live_view["close"],
-                            increasing_line_color="#26a69a",
-                            decreasing_line_color="#ef5350",
-                            name=first_sym,
-                        ))
-                        fig_live.update_layout(
-                            template="plotly_dark", height=350,
-                            xaxis_rangeslider_visible=False,
-                            margin=dict(l=40, r=40, t=20, b=20),
+                        fig_live = candlestick_chart(
+                            live_view,
                             title=f"{first_sym} — last {len(live_view)} bars",
+                            height=350,
                         )
                         st.plotly_chart(fig_live, use_container_width=True)
                 except Exception:

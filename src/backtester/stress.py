@@ -143,6 +143,7 @@ class SignalStressTest:
         self,
         data: pd.DataFrame,
         l2: list[OrderBookSnapshot] | None = None,
+        timeframe: str | None = None,
     ) -> StressResult:
         combos = self._build_combos()
         rows = []
@@ -154,7 +155,7 @@ class SignalStressTest:
             bt = Backtester(signal=sig, config=self.config, cost_model=self.cost_model)
 
             try:
-                res = bt.run(data, l2)
+                res = bt.run(data, l2, timeframe=timeframe)
                 summary = res.summary()
                 key = str(combo)
                 rows.append({**combo, **summary})

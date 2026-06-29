@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import copy
 import csv
+from datetime import datetime
 import logging
 import os
 import select
@@ -151,7 +152,8 @@ class LiveEngine:
         self._kill_listener = _ManualKillSwitch(self._manual_kill)
 
         os.makedirs(self.config.log_dir, exist_ok=True)
-        self._trade_log_path = os.path.join(self.config.log_dir, self.config.trade_log_csv)
+        self._run_log_dir: str = self.config.log_dir  # replaced in start()
+        self._trade_log_path: str = ""                 # set in start()
         self._universe = Universe(symbols=self._symbols)
 
     # ── Component resolution ──────────────────────────────────────────────
@@ -176,6 +178,11 @@ class LiveEngine:
     # ── Lifecycle ─────────────────────────────────────────────────────────
 
     def start(self):
+        run_ts = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+        self._run_log_dir = os.path.join(self.config.log_dir, run_ts)
+        os.makedirs(self._run_log_dir, exist_ok=True)
+        self._trade_log_path = os.path.join(self._run_log_dir, self.config.trade_log_csv)
+
         self._setup_logging()
         logger.info("=" * 60)
         logger.info("LIVE ENGINE STARTING — %s on %s (%s)", self.strategy.__class__.__name__, ", ".join(self._symbols), self.config.exchange)
@@ -578,6 +585,6 @@ class LiveEngine:
             format=log_fmt,
             handlers=[
                 logging.StreamHandler(),
-                logging.FileHandler(os.path.join(self.config.log_dir, "live_engine.log"), mode="a"),
+                logging.FileHandler(os.path.join(self._run_log_dir, "live_engine.log"), mode="a"),
             ],
         )

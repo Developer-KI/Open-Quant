@@ -1,8 +1,47 @@
 # Quantitative Trading Framework
 
-A modular, multi-asset, multi-exchange Python framework for developing, backtesting, and live-trading quantitative strategies on crypto perpetual futures and spot markets. Hyperliquid and Binance Futures are supported out of the box; any exchange can be added via the registry pattern.
+A modular, multi-asset, multi-exchange Python framework for developing, backtesting, and live-trading quantitative strategies on crypto perpetual futures and spot markets. Hyperliquid and Binance are supported out of the box; any exchange can be plugged in via the registry pattern.
 
 Designed with a clean C++/Python seam: execution-critical hot paths are isolated behind `typing.Protocol` interfaces so they can be replaced with `pybind11` C++ extensions without touching strategy code.
+
+---
+
+## Quick Start
+
+```bash
+# Install dependencies (Python 3.10+)
+pip install pandas pyarrow numpy streamlit plotly websockets
+
+# Launch the dashboard
+streamlit run app/main.py
+
+# Collect data (Hyperliquid ETH — all streams)
+python -m src.data.feeds.hyperliquid --coin ETH --mode all
+
+# Run the backtest demo
+python trading/strategy_backtest_demo.py
+```
+
+---
+
+## Data Directory Layout
+
+The scrapers and app share a single root:
+
+```
+data/
+├── trades/
+│   ├── HYPERLIQUID_PERPETUALS/<symbol>/*.parquet   # raw tick trades
+│   ├── HYPERLIQUID_SPOT/<symbol>/*.parquet
+│   └── BINANCE_PERPETUALS/<symbol>/*.parquet
+├── l2/
+│   └── HYPERLIQUID_PERPETUALS/<symbol>/*.parquet   # L2 order book snapshots
+├── funding/
+│   └── HYPERLIQUID_PERPETUALS/<symbol>/*.parquet   # funding rate snapshots
+└── sentiment/                                       # optional: CSV files
+```
+
+Each subfolder is written by the scrapers (`src/data/feeds/`) and read by the app (`app/pages/`) and parsers (`src/core/parser.py`).
 
 ---
 
@@ -11,10 +50,10 @@ Designed with a clean C++/Python seam: execution-critical hot paths are isolated
 ```
 src/
 ├── core/               # Stable contracts — models, protocols, events, parser
-│   ├── models.py       # ALL data types (Side, Position, Trade, SignalResult, …)
+│   ├── models.py       # ALL data types (Side, Position, Trade, FundingSnapshot, …)
 │   ├── protocols.py    # typing.Protocol interfaces for C++ interop
 │   ├── events.py       # Typed event structs (BarEvent, TradeEvent, L2Event)
-│   └── parser.py       # L2 order-book parser + OHLCV utilities
+│   └── parser.py       # Parsers: OHLCV resampling, L2, funding rate alignment
 │
 ├── risk/               # Risk layer — depends only on core/
 │   ├── sizing.py       # Position sizers (Kelly, VolTarget, Fixed, Composite, …)
@@ -24,13 +63,13 @@ src/
 ├── strategy/           # Pure-Python strategy framework — depends on core/ + risk/
 │   ├── base.py         # Signal, Strategy, CrossExchangeStrategy ABC + registries
 │   ├── built_in.py     # SingleSignalStrategy, ZPairsSpread, CrossAssetMomentum, …
-│   ├── indicators.py   # Stateless indicator functions (ema, rsi, atr, …)
-│   ├── universe.py     # Universe + auxiliary data sources
+│   ├── indicators.py   # Stateless indicator functions (ema, rsi, atr, bollinger, …)
+│   ├── universe.py     # Universe + auxiliary data sources (DataSource, StaticDataSource)
 │   └── overlay.py      # Cross-exchange portfolio overlays
 │
 ├── backtester/         # Vectorized backtest engine — depends on core/ + risk/ + strategy/
 │   ├── engine.py       # Backtester (single-asset and multi-asset APIs)
-│   ├── costs.py        # Pluggable transaction cost models
+│   ├── costs.py        # Pluggable cost models (fee, slippage, funding, impact, …)
 │   └── stress.py       # Signal / cost / regime / Monte Carlo stress tests
 │
 ├── execution/          # Live trading — depends on core/ + risk/ + strategy/
@@ -44,28 +83,19 @@ src/
 │
 ├── data/               # Unified data layer — depends only on core/
 │   ├── feeds/
-│   │   ├── base.py              # DataFeedProtocol (subscribe/unsubscribe/start/stop)
 │   │   ├── hyperliquid.py       # HL perp/spot multi-stream (trades, L2, funding, wallet)
-│   │   ├── hyperliquid_bridge.py # Live Arbitrum bridge flows via Alchemy WebSocket
 │   │   ├── binance.py           # Binance trades/depth/funding + batch backfill
-│   │   └── binance_liquidations.py # Global liquidation stream (!forceOrder@arr)
+│   │   ├── hyperliquid_bridge.py # Live Arbitrum bridge flows
+│   │   └── binance_liquidations.py # Global liquidation stream
 │   ├── historical/
-│   │   ├── hyperliquid_bridge.py # Retroactive bridge deposit/withdrawal (Arbiscan)
-│   │   └── hyperliquid_l2.py    # Bulk L2 tick download from S3 archive (LZ4)
-│   ├── sentiment/
-│   │   ├── x.py        # X.com Playwright scraper
-│   │   ├── reddit.py   # Reddit incremental post/comment scraper
-│   │   ├── telegram.py # Telegram channel/group message fetcher
-│   │   └── chan.py     # 4chan /biz/ scraper
-│   └── auxiliary/
-│       ├── bid_ask.py  # HL market microstructure scanner (spreads, MM scoring)
-│       └── crypto.py   # Macro REST poller (Binance OI, DeFiLlama, Deribit vol)
+│   │   └── hyperliquid_l2.py    # Bulk L2 tick download from Hyperliquid S3 archive
+│   ├── sentiment/               # X.com, Reddit, Telegram, 4chan scrapers
+│   └── auxiliary/               # Macro REST poller, microstructure scanner
 │
-└── utils/              # Shared utilities
-    ├── plotting.py             # Equity curve + trade visualisation
-    ├── sentiment_preprocess.py # Text cleaning + tokenisation
-    ├── sentiment_score.py      # VADER / transformer sentiment scoring
-    └── http.py                 # Lightweight GET/POST HTTP client (DataFetcher)
+└── utils/
+    ├── plotting.py              # Equity curve + trade visualisation
+    ├── sentiment_score.py       # VADER / transformer sentiment scoring
+    └── http.py                  # Lightweight HTTP client
 ```
 
 ### Dependency order
@@ -84,67 +114,103 @@ No module imports upward or sideways outside this DAG.
 
 ---
 
-## Core Concepts
+## Parsers (`core/parser.py`)
 
-### Data Models (`core/models.py`)
+### Timeframes
+
+All parsers accept a `timeframe` string. Supported values:
+
+| Label | Bar size | Bars / year |
+|-------|----------|-------------|
+| `"1m"` | 1 minute | 525,600 |
+| `"2m"` | 2 minutes | 262,800 |
+| `"3m"` | 3 minutes | 175,200 |
+| `"5m"` | 5 minutes | 105,120 |
+| `"10m"` | 10 minutes | 52,560 |
+| `"15m"` | 15 minutes | 35,040 |
+| `"30m"` | 30 minutes | 17,520 |
+| `"1h"` | 1 hour | 8,760 |
+| `"2h"` | 2 hours | 4,380 |
+| `"4h"` | 4 hours | 2,190 |
+| `"6h"` | 6 hours | 1,460 |
+| `"8h"` | 8 hours | 1,095 |
+| `"12h"` | 12 hours | 730 |
+| `"1d"` | 1 day | 365 |
+
+```python
+from core.parser import TIMEFRAMES, timeframe_to_seconds, timeframe_to_bars_per_year
+```
+
+### OHLCV
+
+```python
+from core.parser import trades_to_ohlcv
+
+# Resample raw trade ticks into any bar size
+eth_1m  = trades_to_ohlcv("data/trades/HYPERLIQUID_PERPETUALS/ETH", timeframe="1m")
+eth_5m  = trades_to_ohlcv("data/trades/HYPERLIQUID_PERPETUALS/ETH", timeframe="5m")
+eth_1h  = trades_to_ohlcv("data/trades/HYPERLIQUID_PERPETUALS/ETH", timeframe="1h")
+eth_1d  = trades_to_ohlcv("data/trades/HYPERLIQUID_PERPETUALS/ETH", timeframe="1d")
+# → DataFrame(index=DatetimeIndex, columns=[open, high, low, close, volume])
+```
+
+### L2 Order Book
+
+```python
+from core.parser import l2_to_orderbook, parse_l2, align_l2_to_ohlcv
+
+# Load and parse L2 snapshots (aligned 1:1 with OHLCV bars by default)
+snapshots = l2_to_orderbook("data/l2/HYPERLIQUID_PERPETUALS/ETH", ohlcv_data=eth_1m)
+
+# Manual alignment with different methods
+raw_snaps = l2_to_orderbook("data/l2/...", aligned=False)
+aligned   = align_l2_to_ohlcv(raw_snaps, eth_1m, method="last")     # default
+aligned   = align_l2_to_ohlcv(raw_snaps, eth_1m, method="nearest")
+aligned   = align_l2_to_ohlcv(raw_snaps, eth_1m, method="vwap")     # merge within bar
+```
+
+### Funding Rate
+
+```python
+from core.parser import funding_to_snapshots, align_funding_to_ohlcv
+
+# Parse raw funding parquet → list[FundingSnapshot]
+fund_snaps = funding_to_snapshots("data/funding/HYPERLIQUID_PERPETUALS/ETH")
+
+# Align one snapshot per OHLCV bar (same interface as L2 alignment)
+aligned_funding = align_funding_to_ohlcv(fund_snaps, eth_1m, method="last")
+# → each entry has: .rate, .rate_annualized, .mark_price, .oracle_price
+```
+
+`FundingSnapshot` fields:
+
+| Field | Type | Description |
+|---|---|---|
+| `timestamp` | `pd.Timestamp` | When this rate was published |
+| `rate` | `float` | Per-period rate (e.g. `0.0001` = 1 bps per 8h) |
+| `rate_annualized` | `float` | Annualised rate in bps |
+| `oracle_price` | `float` | Spot / index price from the exchange |
+| `mark_price` | `float` | Fair price used for funding and liquidation calcs |
+
+---
+
+## Data Models (`core/models.py`)
 
 All data types live in one file with no internal dependencies:
 
 | Type | Purpose |
 |---|---|
-| `Side` | `LONG` / `SHORT` enum |
-| `OrderType` | `MARKET` / `LIMIT` enum |
+| `Side` | `LONG` / `SHORT` / `FLAT` enum |
 | `OrderBookLevel` | Single price/size level |
-| `OrderBookSnapshot` | Full L2 snapshot with timestamp |
+| `OrderBookSnapshot` | Full L2 snapshot with timestamp; `.mid`, `.spread`, `.vwap_fill_price()` |
 | `FundingSnapshot` | Funding rate + mark/oracle prices |
-| `Trade` | Completed trade record |
+| `Trade` | Completed trade record (entry, exit, pnl, fees, slippage) |
 | `Position` | Open position state |
-| `SignalResult` | Signal output (side, price, metadata) |
+| `SignalResult` | Signal output (side, weight, confidence, reason, stop/tp prices) |
 | `FillResult` | Order fill record from executor |
-| `ExchangeCredentials` | API keys + testnet flag |
-| `LiveConfig` | Risk limits for live trading |
-| `BacktestConfig` | Fee rates + slippage for backtests |
-
-### Protocol Interfaces (`core/protocols.py`)
-
-Uses `typing.Protocol` (structural subtyping) rather than ABCs for the execution layer:
-
-```python
-from core.protocols import ExecutorProtocol, FeedProtocol, BarBuilderProtocol
-```
-
-A C++ class wrapped with `pybind11` satisfies these without Python inheritance — no `register()` calls, no base class required. All three protocols are `@runtime_checkable`.
-
-### Risk Layer (`risk/`)
-
-Risk is independent of strategy. It depends only on `core/`:
-
-```python
-# Position sizing
-from risk.sizing import VolatilityTargetSizer, KellySizer, CompositeSizer
-
-# Stop-loss
-from risk.stops import ATRStop, TrailingStop, RiskRewardStop, CompositeStopLoss
-
-# Kill-switch
-from risk.limits import check_daily_loss_limit, DailyLimitState
-```
-
-Sizers and stops are pluggable: pass any `Sizer` / `StopLoss` instance to `LiveEngine` or `Backtester`.
-
-### Exchange Registry (`execution/factory.py`)
-
-Adding a new exchange requires two dict entries and no if/elif chains:
-
-```python
-from execution.factory import register_exchange
-
-register_exchange(
-    "bybit",
-    executor_factory=make_bybit_executor,  # (ExchangeCredentials) → BaseExecutor
-    feed_factory=make_bybit_feed,           # (symbol, testnet, **kw) → BaseFeed
-)
-```
+| `BacktestConfig` | Fee rates, slippage, funding, leverage for backtests |
+| `LiveConfig` | Full config for live trading (credentials, symbols, risk limits) |
+| `ExchangeCredentials` | API keys + testnet flag per exchange |
 
 ---
 
@@ -154,8 +220,8 @@ register_exchange(
 
 ```python
 from strategy.base import Signal, SignalResult, register_signal
+from strategy.indicators import ema
 from core.models import Side
-import pandas as pd
 
 @register_signal("ema_cross")
 class EMACross(Signal):
@@ -163,36 +229,43 @@ class EMACross(Signal):
         super().__init__(**kw)
         self.fast, self.slow = fast, slow
 
-    def setup(self, data: pd.DataFrame, l2=None):
-        self.fast_ema = data["close"].ewm(span=self.fast).mean()
-        self.slow_ema = data["close"].ewm(span=self.slow).mean()
+    @property
+    def params(self):
+        return {"fast": self.fast, "slow": self.slow}
 
-    def generate(self, i: int, data: pd.DataFrame, l2=None) -> SignalResult | None:
-        if self.fast_ema.iloc[i] > self.slow_ema.iloc[i]:
-            return SignalResult(side=Side.LONG, price=data["close"].iloc[i])
-        if self.fast_ema.iloc[i] < self.slow_ema.iloc[i]:
-            return SignalResult(side=Side.SHORT, price=data["close"].iloc[i])
-        return None
+    def setup(self, data, l2=None):
+        data["ema_f"] = ema(data["close"], self.fast)
+        data["ema_s"] = ema(data["close"], self.slow)
+
+    def generate(self, data, idx):
+        if idx < self.slow:
+            return SignalResult()
+        if data["ema_f"].iat[idx] > data["ema_s"].iat[idx]:
+            return SignalResult(target_side=Side.LONG, target_weight=1.0, reason="cross_up")
+        if data["ema_f"].iat[idx] < data["ema_s"].iat[idx]:
+            return SignalResult(target_side=Side.SHORT, target_weight=1.0, reason="cross_dn")
+        return SignalResult()
 ```
 
 ### Multi-asset strategy
 
 ```python
-from strategy.base import Strategy, StrategyContext, Allocation, PortfolioTarget, register_strategy
+from strategy.base import Strategy, StrategyContext, PortfolioTarget, register_strategy
 from core.models import Side
 
 @register_strategy("momentum")
 class MomentumStrategy(Strategy):
     def setup(self, universe):
-        pass  # precompute indicators from universe.get("ETH")
+        pass  # precompute indicators from universe.ohlcv("ETH"), etc.
 
     def generate(self, ctx: StrategyContext) -> PortfolioTarget:
-        targets = {}
-        for symbol in ctx.symbols:
-            data = ctx.data(symbol)
-            # ...compute allocation...
-            targets[symbol] = Allocation(side=Side.LONG, size=0.5)
-        return PortfolioTarget(allocations=targets)
+        target = PortfolioTarget()
+        for symbol in ctx.universe.symbols:
+            closes = ctx.universe.close(symbol)
+            ret = closes.pct_change(20).iat[ctx.bar_idx]
+            side = Side.LONG if ret > 0 else Side.SHORT
+            target.set(symbol, side=side, weight=0.5)
+        return target
 ```
 
 ---
@@ -203,18 +276,44 @@ class MomentumStrategy(Strategy):
 from backtester.engine import Backtester
 from backtester.costs import CompositeCostModel, aggressive_cost_stack
 from core.models import BacktestConfig
-from core.parser import l2_to_orderbook
+from core.parser import trades_to_ohlcv, l2_to_orderbook, funding_to_snapshots, align_funding_to_ohlcv
 from strategy.universe import Universe
 
-config = BacktestConfig(maker_fee=0.0002, taker_fee=0.0005)
-costs = CompositeCostModel(aggressive_cost_stack())
-universe = Universe().add("ETH", eth_df).add("BTC", btc_df)
+timeframe = "1h"
+eth_ohlcv = trades_to_ohlcv("data/trades/HYPERLIQUID_PERPETUALS/ETH", timeframe=timeframe)
 
-bt = Backtester(strategy=my_strategy, config=config, cost_model=costs)
-result = bt.run(universe=universe)
-result.summary()
-result.plot_equity()
+# Optional: load and attach L2 + funding snapshots
+l2_snaps   = l2_to_orderbook("data/l2/HYPERLIQUID_PERPETUALS/ETH", eth_ohlcv)
+fund_snaps = align_funding_to_ohlcv(
+    funding_to_snapshots("data/funding/HYPERLIQUID_PERPETUALS/ETH"),
+    eth_ohlcv,
+)
+
+universe = Universe(symbols=["ETH"])
+universe.add_asset("ETH", eth_ohlcv, l2=l2_snaps, funding=fund_snaps)
+
+config = BacktestConfig(taker_fee_bps=5.0, slippage_bps=1.0)
+costs  = CompositeCostModel(models=aggressive_cost_stack())
+
+bt = Backtester(signal=EMACross(fast=12, slow=26), config=config, cost_model=costs)
+
+# timeframe drives accurate annualisation of Sharpe, vol, etc.
+result = bt.run(universe=universe, timeframe=timeframe)
+print(result.summary())
+result.save("ema_cross_1h")
 ```
+
+`BacktestResult` interface:
+
+| Method / field | Description |
+|---|---|
+| `.summary()` | dict: Sharpe, Calmar, max DD, win rate, total fees, … |
+| `.trades_df()` | DataFrame of all closed trades |
+| `.equity_curve` | `pd.Series` indexed by timestamp |
+| `.signal_log` | per-bar signal values |
+| `.plot_equity(path)` | saves equity + drawdown PNG |
+| `.save(run_name)` | saves `log.json`, `trades.csv`, `equity_curve.png`, `signal_log.csv` |
+| `.trades_by_symbol(sym)` | filter trades in multi-asset runs |
 
 ### Stress testing
 
@@ -222,12 +321,16 @@ result.plot_equity()
 from backtester.stress import SignalStressTest, CostStressTest, MonteCarloStress
 
 # Sweep signal parameters
-sweep = SignalStressTest(signal_cls=EMACross, param_grid={"fast": [8,12,20], "slow": [26,50]})
-sweep.run(data=eth_df).summary()
+sweep = SignalStressTest(
+    signal_cls=EMACross,
+    param_grid={"fast": [5, 8, 12, 20], "slow": [21, 26, 50]},
+)
+result = sweep.run(data=eth_ohlcv, timeframe=timeframe)
+result.plot_heatmap("fast", "slow", z="sharpe_ratio")
 
 # Bootstrap trade sequence
 mc = MonteCarloStress(n_samples=1000)
-mc.run(result).plot_confidence_bands()
+mc.run(backtest_result).plot_confidence_bands()
 ```
 
 ---
@@ -238,22 +341,30 @@ mc.run(result).plot_confidence_bands()
 
 ```python
 from execution.live_engine import LiveEngine
-from execution.factory import create_executor, create_feed
-from core.models import ExchangeCredentials, LiveConfig
+from core.models import LiveConfig
+from core.parser import timeframe_to_seconds
 from risk.sizing import VolatilityTargetSizer
 from risk.stops import ATRStop
 
-cred = ExchangeCredentials(exchange="hyperliquid", account_address="0x...", secret_key="0x...", testnet=True)
-config = LiveConfig(max_daily_loss_pct=2.0, max_position_size=0.1)
+config = LiveConfig(
+    exchange="hyperliquid",
+    account_address="0x...",
+    secret_key="0x...",
+    use_testnet=True,
+    symbol="ETH",
+    bar_interval_s=timeframe_to_seconds("5m"),   # 300 seconds
+    warmup_bars=200,
+    risk_per_trade=0.02,
+    max_daily_loss_pct=3.0,
+)
 
 engine = LiveEngine(
-    strategy=my_strategy,
-    credentials=cred,
+    signal=EMACross(fast=12, slow=26),
     config=config,
     sizer=VolatilityTargetSizer(target_vol=0.15),
-    stop_loss=ATRStop(multiplier=2.0),
+    stop_loss=ATRStop(atr_mult_sl=2.0, atr_mult_tp=3.0),
 )
-engine.run(symbol="ETH", interval_s=60)
+engine.start()
 ```
 
 ### Cross-exchange (funding arb, delta-neutral)
@@ -267,61 +378,88 @@ engine = MultiExchangeEngine(
     credentials=[hl_cred, binance_cred],
     config=live_config,
 )
-engine.run(symbols=["ETH", "BTC"])
+engine.start()
 ```
 
 ---
 
-## C++/Python Migration Path
+## Data Collection
 
-The project is designed so execution-critical hot paths can be replaced with C++ extensions one module at a time, without touching strategy code:
+### Hyperliquid (trades + L2 + funding)
 
-| Module | Current | Future C++ target |
-|---|---|---|
-| `core/protocols.py` `BarBuilderProtocol` | Python bar builder | Lock-free ring buffer via `pybind11` |
-| `execution/base_executor_feed.py` `BaseBarBuilder` | Pure Python | C++ OHLCV aggregator |
-| `execution/live_state.py` | Python dataclass | C++ POD struct |
-| `execution/live_engine.py` `_process_bar` | Python per-bar loop | C++ event loop |
+```bash
+# All streams for ETH perpetual
+python -m src.data.feeds.hyperliquid --coin ETH --mode all
 
-**Binding approach:** `pybind11` (recommended). C++ classes that satisfy the `Protocol` shapes in `core/protocols.py` are accepted anywhere in the stack without Python inheritance.
+# Just trades and L2 (no funding; spot does not have funding)
+python -m src.data.feeds.hyperliquid --coin ETH --mode l2/trades
 
-```cpp
-// bar_builder.cpp (example pybind11 binding)
-#include <pybind11/pybind11.h>
-namespace py = pybind11;
+# L2 depth 5 levels
+python -m src.data.feeds.hyperliquid --coin ETH --mode l2 --depth 5
 
-class CppBarBuilder { /* ... */ };
-
-PYBIND11_MODULE(cpp_bar_builder, m) {
-    py::class_<CppBarBuilder>(m, "CppBarBuilder")
-        .def("push_trade", &CppBarBuilder::push_trade)
-        .def("latest_bar", &CppBarBuilder::latest_bar);
-}
+# Wallet fills + order updates
+python -m src.data.feeds.hyperliquid --wallet 0xYOUR_ADDRESS
 ```
 
-The Python `BarBuilderProtocol` check (`isinstance(bb, BarBuilderProtocol)`) will pass automatically.
+### Binance
+
+```bash
+python -m src.data.feeds.binance --coin ETHUSDT --market futures --streams trades l2 funding
+```
+
+Data is saved as parquet chunks under `data/<stream>/<exchange>/<symbol>/`.
+
+---
+
+## Streamlit Dashboard
+
+```bash
+streamlit run app/main.py
+```
+
+Three pages:
+
+| Page | Contents |
+|---|---|
+| **Data Explorer** | OHLCV charts with configurable bar timeframe; L2 depth + spread; funding rate over time; sentiment scatter; macro indicators |
+| **Backtester** | Signal selector + auto-generated param fields; bar timeframe selector; BacktestConfig (fees, slippage, leverage); Sizer; StopLoss; parameter sweep heatmap |
+| **Live Trading** | Exchange credentials; bar timeframe dropdown; risk limits; signal/sizer/stop forms; live equity and position dashboard |
 
 ---
 
 ## Adding an Exchange
 
-1. Create `src/execution/<exchange>/` with an executor and feed module that inherit from `BaseExecutor` and `BaseFeed`.
-2. Add two factory functions and register them:
+1. Create `src/execution/<exchange>/` with executor and feed modules inheriting from `BaseExecutor` and `BaseFeed`.
+2. Register it:
 
 ```python
-# execution/bybit/__init__.py (or any startup file)
 from execution.factory import register_exchange
-from .bybit_executor import BybitExecutor
-from .bybit_feed import BybitFeed
+from .my_executor import MyExecutor
+from .my_feed import MyFeed
 
 register_exchange(
-    "bybit",
-    executor_factory=lambda cred: BybitExecutor(cred.api_key, cred.api_secret, cred.testnet),
-    feed_factory=lambda symbol, testnet, **_: BybitFeed(symbol, testnet),
+    "myexchange",
+    executor_factory=lambda cred: MyExecutor(cred.api_key, cred.api_secret, cred.testnet),
+    feed_factory=lambda symbol, testnet, **_: MyFeed(symbol, testnet),
 )
 ```
 
-3. Pass `ExchangeCredentials(exchange="bybit", ...)` to `LiveEngine` — factory resolves the rest.
+3. Pass `ExchangeCredentials(exchange="myexchange", ...)` to `LiveEngine` — the factory resolves the rest.
+
+---
+
+## C++/Python Migration Path
+
+Execution-critical hot paths can be replaced with pybind11 C++ extensions one module at a time, without touching any strategy code:
+
+| Module | Current | Future C++ target |
+|---|---|---|
+| `core/protocols.py` `BarBuilderProtocol` | Python bar aggregator | Lock-free ring buffer |
+| `execution/base_executor_feed.py` `BaseBarBuilder` | Pure Python | C++ OHLCV aggregator |
+| `execution/live_state.py` | Python dataclass | C++ POD struct |
+| `execution/live_engine.py` `_process_bar` | Python per-bar loop | C++ event loop |
+
+C++ classes that satisfy the `Protocol` shapes in `core/protocols.py` are accepted anywhere in the stack without Python inheritance — no `register()` calls, no base class required.
 
 ---
 
@@ -329,6 +467,6 @@ register_exchange(
 
 | Script | What it shows |
 |---|---|
-| `trading/strategy_backtest_demo.py` | Multi-asset backtest with cost model and stress test |
+| `trading/strategy_backtest_demo.py` | EMA cross signal, full backtest with cost model, parameter sweep |
 | `trading/strategy_live_demo.py` | Single-asset live run on Hyperliquid testnet |
-| `trading/p_strategy.py` | Cross-exchange funding-rate arbitrage (delta-neutral) |
+| `trading/p_strategy.py` | Cross-exchange funding-rate arbitrage (delta-neutral, multi-exchange) |

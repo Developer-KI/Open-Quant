@@ -202,13 +202,12 @@ def plot_orderflow(
         margin=dict(l=50, r=20, t=60, b=20),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
     )
+    fig.update_yaxes(title_text="Price", row=1, col=1)
+    fig.update_yaxes(title_text="Volume", row=2, col=1)
     fig.update_yaxes(
         title_text="Spread %", ticksuffix="%", tickformat=".4f", row=3, col=1
     )
-    fig.update_yaxes(title_text="Price", row=1, col=1)
-    fig.update_yaxes(title_text="Volume", row=2, col=1)
     fig.update_yaxes(title_text="Size (+Bid / -Ask)", row=4, col=1)
-    fig.update_yaxes(title_text="Spread ($)", row=3, col=1)  # New
 
     fig.update_xaxes(showgrid=True, gridwidth=1, gridcolor="rgba(255,255,255,0.1)")
     fig.update_yaxes(showgrid=True, gridwidth=1, gridcolor="rgba(255,255,255,0.1)")
@@ -275,7 +274,24 @@ def plot_features(
     else:
         fig = go.Figure()
         for name, series in plot_data:
-            fig.add_trace(go.Scattergl(x=series.index, y=series, mode=mode, name=name))
+            fig.add_trace(
+                go.Scattergl(
+                    x=series.index,
+                    y=series,
+                    mode=mode,
+                    name=name,
+                    line_shape=line_shape,
+                )
+            )
 
-    fig.update_layout(template="plotly_dark", title_text=title, height=height)
+    fig.update_layout(
+        template="plotly_dark",
+        title_text=title,
+        height=height,
+        hovermode="x unified",
+        margin=dict(l=50, r=20, t=60, b=20),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+    )
+    fig.update_xaxes(showgrid=True, gridwidth=1, gridcolor="rgba(255,255,255,0.1)")
+    fig.update_yaxes(showgrid=True, gridwidth=1, gridcolor="rgba(255,255,255,0.1)")
     return fig

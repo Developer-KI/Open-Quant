@@ -16,8 +16,10 @@ from components.charts import (
     depth_chart, funding_chart, funding_rate_mini, macro_chart, rsi_chart,
     sentiment_scatter, spread_chart, volume_bars,
 )
+from components.style import inject
 
 st.set_page_config(page_title="Data Explorer", page_icon="📊", layout="wide")
+inject()
 st.title("Data Explorer")
 
 DATA_DIR = st.session_state.get("data_dir", _ROOT / "data")
@@ -34,6 +36,8 @@ with st.sidebar:
 
     st.divider()
     st.subheader("OHLCV options")
+    from core.parser import TIMEFRAMES
+    ohlcv_timeframe = st.selectbox("Bar timeframe", TIMEFRAMES, index=0, key="data_tf")
     overlay_ema = st.checkbox("EMA", value=True)
     if overlay_ema:
         ema_fast = st.number_input("EMA fast", value=12, step=1, min_value=2)
@@ -74,10 +78,10 @@ with tab_price:
         if st.button("Load data", key="load_ohlcv"):
             with st.spinner("Parsing trade data…"):
                 try:
-                    from core.parser import trades_to_ohlc
-                    _df = trades_to_ohlc(trades_path)
+                    from core.parser import trades_to_ohlcv
+                    _df = trades_to_ohlcv(trades_path, timeframe=ohlcv_timeframe)
                     st.session_state["ohlcv_df"] = _df
-                    st.success(f"Loaded {len(_df):,} bars")
+                    st.success(f"Loaded {len(_df):,} bars ({ohlcv_timeframe})")
                 except Exception as e:
                     st.error(f"OHLCV load failed: {e}")
 
@@ -98,11 +102,16 @@ with tab_price:
                 if _fund_path.exists():
                     with st.spinner("Loading funding rates…"):
                         try:
-                            _df_f = pd.read_parquet(_fund_path)
-                            if "timestamp" in _df_f.columns:
-                                _df_f["timestamp"] = pd.to_datetime(_df_f["timestamp"], unit="ms", utc=True)
-                                _df_f = _df_f.set_index("timestamp").sort_index()
-                            st.session_state["funding_df"] = _df_f
+                            from core.parser import funding_to_snapshots
+                            _fund_snaps = funding_to_snapshots(_fund_path)
+                            st.session_state["funding_snapshots"] = _fund_snaps
+                            if _fund_snaps:
+                                _df_f = pd.DataFrame([
+                                    {"funding_rate": s.rate, "funding_rate_ann_bps": s.rate_annualized,
+                                     "mark_price": s.mark_price, "oracle_price": s.oracle_price}
+                                    for s in _fund_snaps
+                                ], index=pd.DatetimeIndex([s.timestamp for s in _fund_snaps]))
+                                st.session_state["funding_df"] = _df_f
                         except Exception as e:
                             st.warning(f"Funding load failed: {e}")
                 else:
@@ -233,12 +242,10 @@ with tab_ob:
 
         ts = [s.timestamp for s in snapshots]
         spreads = [s.spread_bps for s in snapshots]
-        fig_spread = go.Figure(go.Scatter(x=ts, y=spreads, name="Spread (bps)",
-                                          line=dict(color="#2196F3", width=1)))
-        fig_spread.update_layout(template="plotly_dark", height=200,
-                                  margin=dict(l=40, r=40, t=20, b=20),
-                                  title="Spread over time (bps)")
-        st.plotly_chart(fig_spread, use_container_width=True)
+        st.plotly_chart(
+            spread_chart(ts, spreads, title="Spread over time (bps)", height=200),
+            use_container_width=True,
+        )
 
 # ═══════════════════════════════════════════════════════════════════ Funding
 
@@ -255,12 +262,17 @@ with tab_funding:
                     if not parts:
                         st.warning("No Parquet files found.")
                     else:
-                        df_f = pd.read_parquet(funding_path)
-                        if "timestamp" in df_f.columns:
-                            df_f["timestamp"] = pd.to_datetime(df_f["timestamp"], unit="ms", utc=True)
-                            df_f = df_f.set_index("timestamp").sort_index()
-                        st.session_state["funding_df"] = df_f
-                        st.success(f"Loaded {len(df_f):,} rows")
+                        from core.parser import funding_to_snapshots
+                        fund_snaps = funding_to_snapshots(funding_path)
+                        st.session_state["funding_snapshots"] = fund_snaps
+                        if fund_snaps:
+                            df_f = pd.DataFrame([
+                                {"funding_rate": s.rate, "funding_rate_ann_bps": s.rate_annualized,
+                                 "mark_price": s.mark_price, "oracle_price": s.oracle_price}
+                                for s in fund_snaps
+                            ], index=pd.DatetimeIndex([s.timestamp for s in fund_snaps]))
+                            st.session_state["funding_df"] = df_f
+                            st.success(f"Loaded {len(fund_snaps):,} snapshots")
                 except Exception as e:
                     st.error(f"Failed: {e}")
 

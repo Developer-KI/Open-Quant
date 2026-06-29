@@ -99,7 +99,7 @@ def main():
         exchange="hyperliquid",
         account_address=creds["account_address"],
         secret_key=creds["secret_key"],
-        use_testnet=False,       # ← switch to False for mainnet
+        use_testnet=True,       # ← switch to False for mainnet
         symbol="ETH",           # ← your Hyperliquid coin
         bar_interval_s=60,      # 1-minute bars (same as backtest)
         warmup_bars=200,

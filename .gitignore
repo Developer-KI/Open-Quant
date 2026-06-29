@@ -12,4 +12,5 @@ data/
 *.egg-info/
 
 .env
-resources.txt
+todo.txt
+

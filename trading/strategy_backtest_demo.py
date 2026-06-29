@@ -11,7 +11,7 @@ Shows four patterns:
 from pathlib import Path
 
 from core.models import BacktestConfig, Side
-from core.parser import trades_to_ohlc, l2_to_orderbook
+from core.parser import trades_to_ohlcv, l2_to_orderbook, funding_to_snapshots, align_funding_to_ohlcv
 
 from backtester.engine import Backtester
 from backtester.costs import CompositeCostModel, aggressive_cost_stack
@@ -71,12 +71,14 @@ class DemoEMACross(Signal):
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-DATA_DIR = PROJECT_ROOT / "data" / "cleaned"
+DATA_DIR = PROJECT_ROOT / "data"
 
 
 def demo():
-    eth_data = trades_to_ohlc(
-        DATA_DIR / "trades" / "HYPERLIQUID_PERPETUALS" / "ETH"
+    timeframe = "1m"
+    eth_data = trades_to_ohlcv(
+        DATA_DIR / "trades" / "HYPERLIQUID_PERPETUALS" / "ETH",
+        timeframe=timeframe,
     )
 
     config = BacktestConfig(
@@ -105,19 +107,21 @@ def demo():
     bt = Backtester(
         signal=signal, config=config, cost_model=cost, sizer=sizer, stop_loss=stop
     )
-    result = bt.run(data=eth_data)
+    result = bt.run(data=eth_data, timeframe=timeframe)
 
     print(result.summary())
-    result.plot_equity()
+
+    run_dir = result.save("demo_ema_cross")
+    print(f"Backtest saved to: {run_dir}")
 
     stress = SignalStressTest(
         signal_cls=DemoEMACross,
         param_grid={"fast": [2, 3], "slow": [5, 7]},
-        cost_model=cost
+        cost_model=cost,
     )
 
-    sweep = stress.run(data=eth_data)
-    sweep.plot_heatmap(x="fast", y="slow")
+    sweep = stress.run(data=eth_data, timeframe=timeframe)
+    sweep.plot_heatmap(x="fast", y="slow", save_path=f"{run_dir}/heatmap_signal_sweep.png")
 
 
 if __name__ == "__main__":

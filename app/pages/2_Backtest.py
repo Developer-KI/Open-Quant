@@ -14,8 +14,11 @@ import streamlit as st
 
 from components.charts import candlestick_chart, equity_chart, trade_markers
 from components.forms import backtest_config_form, signal_form, sizer_form, stop_form
+from components.style import inject
+from utils.plotting import plot_features
 
 st.set_page_config(page_title="Backtester", page_icon="🔬", layout="wide")
+inject()
 st.title("Backtester")
 
 DATA_DIR: Path = st.session_state.get("data_dir", _ROOT / "data")
@@ -34,6 +37,8 @@ with st.sidebar:
         key="bt_exch",
     )
     bt_symbol = st.text_input("Symbol", value="ETH", key="bt_sym").upper()
+    from core.parser import TIMEFRAMES
+    bt_timeframe = st.selectbox("Bar timeframe", TIMEFRAMES, index=0, key="bt_tf")
 
     st.divider()
     st.header("Config")
@@ -62,18 +67,19 @@ if run_bt:
         else:
             with st.spinner("Running backtest…"):
                 try:
-                    from core.parser import trades_to_ohlc
+                    from core.parser import trades_to_ohlcv
                     from backtester.engine import Backtester
                     from backtester.costs import CompositeCostModel, aggressive_cost_stack
 
                     signal = signal_cls(**sig_params)
-                    df = trades_to_ohlc(data_path)
+                    df = trades_to_ohlcv(data_path, timeframe=bt_timeframe)
                     cost = CompositeCostModel(models=aggressive_cost_stack())
                     bt = Backtester(signal=signal, config=config, cost_model=cost,
                                    sizer=sizer, stop_loss=stop)
-                    result = bt.run(data=df)
+                    result = bt.run(data=df, timeframe=bt_timeframe)
                     st.session_state["bt_result"] = result
                     st.session_state["bt_ohlcv"] = df
+                    st.session_state["bt_timeframe"] = bt_timeframe
                     st.success("Backtest complete.")
                 except Exception as e:
                     st.error(f"Backtest failed: {e}")
@@ -127,15 +133,7 @@ if result.signal_log is not None and not result.signal_log.empty:
     sig_cols = [c for c in result.signal_log.columns if result.signal_log[c].dtype != object]
     if sig_cols:
         st.subheader("Signal Log")
-        fig_sig = go.Figure()
-        for col in sig_cols[:6]:
-            fig_sig.add_trace(go.Scatter(
-                x=result.signal_log.index, y=result.signal_log[col],
-                name=col, mode="lines",
-            ))
-        fig_sig.update_layout(template="plotly_dark", height=250,
-                               margin=dict(l=40, r=40, t=20, b=20),
-                               legend=dict(orientation="h"))
+        fig_sig = plot_features(result.signal_log, sig_cols[:6], title="Signal Log", height=250)
         st.plotly_chart(fig_sig, use_container_width=True)
 
 # Trade table
@@ -199,11 +197,11 @@ with st.expander("Parameter Sweep"):
                         st.warning("Enter at least one value for Parameter 1.")
                     else:
                         data_path = DATA_DIR / "trades" / exchange_folder / bt_symbol
-                        from core.parser import trades_to_ohlc
+                        from core.parser import trades_to_ohlcv
                         from backtester.costs import CompositeCostModel, aggressive_cost_stack
                         from backtester.stress import SignalStressTest
 
-                        df_stress = trades_to_ohlc(data_path)
+                        df_stress = trades_to_ohlcv(data_path, timeframe=bt_timeframe)
                         cost = CompositeCostModel(models=aggressive_cost_stack())
 
                         param_grid = {p1: vals1}

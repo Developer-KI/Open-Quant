@@ -17,6 +17,7 @@ for _p in [str(_SRC), str(_ROOT), str(_APP)]:
         sys.path.insert(0, _p)
 
 import streamlit as st
+from components.style import inject
 
 # ── Page config (must be first Streamlit command) ─────────────────────────────
 
@@ -26,6 +27,7 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
+inject()
 
 # ── Signal discovery ──────────────────────────────────────────────────────────
 
