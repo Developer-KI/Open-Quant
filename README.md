@@ -315,6 +315,50 @@ result.save("ema_cross_1h")
 | `.save(run_name)` | saves `log.json`, `trades.csv`, `equity_curve.png`, `signal_log.csv` |
 | `.trades_by_symbol(sym)` | filter trades in multi-asset runs |
 
+### Vectorised Fast Path
+
+When two conditions are met, the engine bypasses the Python bar loop entirely and runs a fully NumPy-vectorised backtest that is typically **10–50× faster** on long histories:
+
+| Condition | What enables it |
+|---|---|
+| Stop-loss = `NopStopLoss` | Stops require bar-by-bar high/low checks; without stops the whole array is available upfront |
+| Sizer is `vectorizable` | Position size must be computable from price alone (no equity dependency). `FixedNotionalSizer(notional=…)` qualifies; equity-fraction sizers do not |
+
+**How it works internally:**
+
+1. **Batch signal generation** — `strategy.generate_all(universe)` is called once, returning two dicts of `int8`/`float64` arrays (sides and weights per symbol) without creating any `StrategyContext`/`PortfolioTarget` objects.
+
+2. **Trade boundary detection** (O(M), M = number of trades) — `np.diff` on the sides array finds entry and close bars in one pass. Force-closes at end-of-data are appended explicitly.
+
+3. **Vectorised sizing** — `sizer.compute_vectorized(entry_prices, weights, config)` computes all position sizes in a single numpy call.
+
+4. **Cost arrays** (O(M) Python loop) — entry and exit fees are computed per-trade (not per-bar), then scattered onto sparse arrays via `np.add.at`.
+
+5. **Equity curve via cumsum** — `np.cumsum(close_events - entry_fees)` gives the realised equity at every bar. Unrealised PnL is added via a *forward-fill trick*: `np.maximum.accumulate` on the "last entry bar seen so far" index propagates the entry price and size forward without a Python loop.
+
+```python
+from backtester.engine import Backtester
+from risk.stops import NopStopLoss
+from risk.sizing import FixedNotionalSizer
+
+# Both conditions satisfied → vectorised path activates automatically
+bt = Backtester(
+    signal=MySignal(),
+    stop_loss=NopStopLoss(),
+    sizer=FixedNotionalSizer(notional=10_000),
+)
+result = bt.run(universe=universe, timeframe="1h")
+print(result.meta["vectorized"])  # True
+```
+
+The result is numerically identical to the sequential path. The equity curve at every bar reflects true realized equity (entry and exit fees deducted at the bars where they occur). To confirm which path ran, check `result.meta["vectorized"]`.
+
+**When the fast path does NOT activate:**
+- Any stop-loss other than `NopStopLoss` (ATR stops, trailing stops, etc.)
+- `FixedNotionalSizer(equity_pct=…)` (equity-dependent — not vectorizable)
+- Any sizer whose `.vectorizable` property returns `False`
+- Strategies that return `None` from `generate_all()` (falls back to per-bar loop)
+
 ### Stress testing
 
 ```python

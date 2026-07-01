@@ -21,7 +21,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from core.models import BacktestConfig, Position, Side, OrderBookSnapshot, SignalResult
+from core.models import BacktestConfig, Position, Side, OrderBookSnapshot, Allocation
 
 
 # ── Sizing context ────────────────────────────────────────────────────────────
@@ -33,7 +33,7 @@ class SizingContext:
 
     equity: float
     price: float
-    signal: SignalResult
+    allocation: Allocation
     config: BacktestConfig
     position: Position
     data: pd.DataFrame | None = None
@@ -66,6 +66,28 @@ class Sizer(abc.ABC):
             if hasattr(self, k):
                 setattr(self, k, v)
 
+    @property
+    def vectorizable(self) -> bool:
+        """
+        True when size can be computed from price alone — no dependency on
+        running equity.  Returning True is the second condition required for
+        the vectorised backtest fast path.
+        """
+        return False
+
+    def compute_vectorized(
+        self,
+        prices: np.ndarray,
+        weights: np.ndarray,
+        config: BacktestConfig,
+    ) -> np.ndarray:
+        """
+        Compute position sizes for an array of entry bars without equity state.
+        Only called when ``vectorizable`` is True.
+        """
+        del prices, weights, config
+        raise NotImplementedError(f"{type(self).__name__} is not vectorizable")
+
     def __repr__(self):
         return f"{self.__class__.__name__}({self.params})"
 
@@ -89,10 +111,10 @@ class FixedFractionalSizer(Sizer):
         return dict(risk_frac=self.risk_frac)
 
     def compute(self, ctx: SizingContext) -> float:
-        dollar_risk = ctx.equity * self.risk_frac * ctx.signal.target_weight
+        dollar_risk = ctx.equity * self.risk_frac * ctx.allocation.weight
 
-        if ctx.signal.stop_loss is not None and ctx.signal.stop_loss > 0:
-            sl_dist = abs(ctx.price - ctx.signal.stop_loss)
+        if ctx.allocation.stop_loss is not None and ctx.allocation.stop_loss > 0:
+            sl_dist = abs(ctx.price - ctx.allocation.stop_loss)
             if sl_dist > 0:
                 return (dollar_risk / sl_dist) * ctx.config.leverage
 
@@ -113,11 +135,24 @@ class FixedNotionalSizer(Sizer):
 
     def compute(self, ctx: SizingContext) -> float:
         if self.notional is not None:
-            n = self.notional * ctx.signal.target_weight
+            n = self.notional * ctx.allocation.weight
         else:
-            n = ctx.equity * self.equity_pct * ctx.signal.target_weight
+            n = ctx.equity * self.equity_pct * ctx.allocation.weight
         n *= ctx.config.leverage
         return n / ctx.price if ctx.price > 0 else 0
+
+    @property
+    def vectorizable(self) -> bool:
+        return self.notional is not None
+
+    def compute_vectorized(
+        self,
+        prices: np.ndarray,
+        weights: np.ndarray,
+        config: BacktestConfig,
+    ) -> np.ndarray:
+        notional = self.notional * weights * config.leverage
+        return np.where(prices > 0, notional / prices, 0.0)
 
 
 class VolatilityTargetSizer(Sizer):
@@ -163,7 +198,7 @@ class VolatilityTargetSizer(Sizer):
         per_unit_vol = ctx.price * ann_vol
         size = (
             (dollar_vol_budget / per_unit_vol)
-            * ctx.signal.target_weight
+            * ctx.allocation.weight
             * ctx.config.leverage
         )
         return max(size, 0)
@@ -218,13 +253,13 @@ class KellySizer(Sizer):
             else:
                 kelly_pct = win_rate
         else:
-            kelly_pct = ctx.signal.confidence * 0.5
+            kelly_pct = ctx.allocation.confidence * 0.5
 
         kelly_pct = max(kelly_pct, 0) * self.kelly_frac
         alloc_pct = np.clip(kelly_pct, self.floor, self.cap)
 
         notional = (
-            ctx.equity * alloc_pct * ctx.signal.target_weight * ctx.config.leverage
+            ctx.equity * alloc_pct * ctx.allocation.weight * ctx.config.leverage
         )
         return notional / ctx.price if ctx.price > 0 else 0
 
@@ -281,7 +316,7 @@ class AntiMartingaleSizer(Sizer):
             ctx.equity
             * self.base_risk_frac
             * mult
-            * ctx.signal.target_weight
+            * ctx.allocation.weight
             * ctx.config.leverage
         )
         return notional / ctx.price if ctx.price > 0 else 0
@@ -331,7 +366,7 @@ class DrawdownScalingSizer(Sizer):
             ctx.equity
             * self.base_risk_frac
             * scale
-            * ctx.signal.target_weight
+            * ctx.allocation.weight
             * ctx.config.leverage
         )
         return notional / ctx.price if ctx.price > 0 else 0
@@ -366,14 +401,14 @@ class L2LiquiditySizer(Sizer):
         base_notional = (
             ctx.equity
             * self.base_risk_frac
-            * ctx.signal.target_weight
+            * ctx.allocation.weight
             * ctx.config.leverage
         )
         base_size = base_notional / ctx.price if ctx.price > 0 else 0
 
         if ctx.l2 is not None:
             depth = ctx.l2.depth_at(self.depth_pct)
-            if ctx.signal.target_side == Side.LONG:
+            if ctx.allocation.side == Side.LONG:
                 available = depth.get("ask_depth", float("inf"))
             else:
                 available = depth.get("bid_depth", float("inf"))

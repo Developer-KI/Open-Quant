@@ -141,7 +141,7 @@ class Trade:
     slippage: float = 0.0
     reason_entry: str = ""
     reason_exit: str = ""
-    signal_values: dict[str, Any] = field(default_factory=dict)
+    bar_values: dict[str, Any] = field(default_factory=dict)
     meta: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict:
@@ -158,7 +158,7 @@ class Trade:
             "slippage": self.slippage,
             "reason_entry": self.reason_entry,
             "reason_exit": self.reason_exit,
-            **{f"sig_{k}": v for k, v in self.signal_values.items()},
+            **{f"bar_{k}": v for k, v in self.bar_values.items()},
             **{f"meta_{k}": v for k, v in self.meta.items()},
         }
 
@@ -172,15 +172,15 @@ class Position:
     unrealized_pnl: float = 0.0
 
 
-# ── Signal result (lives here so risk/ can import it without touching strategy/) ─
+# ── Allocation (lives here so risk/ can import it without touching strategy/) ──
 
 
 @dataclass
-class SignalResult:
-    """Output of Signal.generate() — also used as sizing/stop input adapter."""
+class Allocation:
+    """Desired state for one asset — output of SingleAssetStrategy.bar()."""
 
-    target_side: Side = Side.FLAT
-    target_weight: float = 0.0
+    side: Side = Side.FLAT
+    weight: float = 0.0
     confidence: float = 0.0
     reason: str = ""
     order_type: str = "market"

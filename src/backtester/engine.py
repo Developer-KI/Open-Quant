@@ -1,25 +1,18 @@
 """
-strategy/engine.py — Unified backtester engine.
+backtester/engine.py — Unified backtester engine.
 
-Drop-in replacement for backtester.engine.Backtester.
-Accepts EITHER the old API or the new multi-asset API:
+  Single-asset:
+      strategy = EMACrossStrategy(symbol="ETH", fast=12, slow=26)
+      bt = Backtester(strategy=strategy)
+      result = bt.run(data=eth_df)
 
-  Old (single asset):
-      bt = Backtester(signal=my_signal)
-      result = bt.run(data=eth_df, l2=snapshots)
-
-  New (multi asset):
+  Multi-asset:
       bt = Backtester(strategy=my_strategy)
       result = bt.run(universe=universe)
 
-  Hybrid (signal auto-wrapped):
-      bt = Backtester(signal=my_signal, symbol="ETH")
-      result = bt.run(universe=universe)
-
-The returned BacktestResult is identical in both cases — same .summary(),
-.trades_df(), .plot_equity(), .to_csv() interface as the original engine.
-Multi-asset runs get extra fields (positions_log, allocation_log,
-trades_by_symbol) on top of the standard ones.
+The returned BacktestResult has the same .summary(), .trades_df(),
+.plot_equity(), .to_csv() interface for both cases.  Multi-asset runs
+add positions_log, allocation_log, and trades_by_symbol.
 """
 
 from __future__ import annotations
@@ -47,12 +40,11 @@ from risk.sizing import Sizer, SizingContext, default_sizer
 from risk.stops import (
     StopLoss,
     StopContext,
-    SignalStop,
+    EmbeddedStop,
     default_stop_loss,
 )
 
-from strategy.base import Signal, Strategy, StrategyContext
-from strategy.built_in import SingleSignalStrategy
+from strategy.base import Strategy, StrategyContext
 from strategy.universe import Universe
 
 
@@ -71,14 +63,14 @@ class BacktestResult:
     trades: list[Trade]
     equity_curve: pd.Series
     positions: pd.Series                            # side per bar (single-asset compat)
-    signal_log: pd.DataFrame                        # per-bar signal/allocation values
+    bar_log: pd.DataFrame                           # per-bar side/weight/confidence
     config: BacktestConfig
     run_time_s: float = 0.0
     meta: dict[str, Any] = field(default_factory=dict)
 
     # ── multi-asset extras (None when single-asset) ──────────────────────
     positions_log: pd.DataFrame | None = None       # per-bar, per-asset positions
-    allocation_log: pd.DataFrame | None = None      # per-bar strategy targets
+    allocation_log: pd.DataFrame | None = None      # per-bar, per-asset allocations
 
     # ── export helpers ───────────────────────────────────────────────────
 
@@ -208,7 +200,7 @@ class BacktestResult:
         return path
 
     def save(self, run_name: str, base_dir: str = "logs/test") -> str:
-        """Save log.json, trades.csv, equity_curve.png, and signal_log.csv to logs/test/<run_name>/."""
+        """Save log.json, trades.csv, equity_curve.png, and bar_log.csv to logs/test/<run_name>/."""
         import dataclasses
         from datetime import datetime, timezone
 
@@ -247,8 +239,8 @@ class BacktestResult:
         self.to_csv(os.path.join(run_dir, "trades.csv"))
         self.plot_equity(save_path=os.path.join(run_dir, "equity_curve.png"))
 
-        if self.signal_log is not None and not self.signal_log.empty:
-            self.signal_log.to_csv(os.path.join(run_dir, "signal_log.csv"), index=False)
+        if self.bar_log is not None and not self.bar_log.empty:
+            self.bar_log.to_csv(os.path.join(run_dir, "bar_log.csv"), index=False)
 
         return run_dir
 
@@ -268,15 +260,13 @@ class _AssetState:
 
 class Backtester:
     """
-    Drop-in replacement for backtester.engine.Backtester.
+    Backtester engine.
 
-    Accepts EITHER:
-      • signal + (optional symbol) — old single-asset API
-      • strategy                   — new multi-asset API
+    Accepts a Strategy and runs it over a Universe (or single DataFrame).
 
     The run() method accepts EITHER:
-      • data + l2                  — old API (single DataFrame)
-      • universe                   — new API (multi-asset Universe)
+      • data + l2   — single DataFrame (auto-wrapped in a Universe)
+      • universe    — multi-asset Universe
 
     Components (sizer, stop_loss, cost_model) can be:
       • A single instance           — shared across all assets
@@ -285,26 +275,17 @@ class Backtester:
 
     def __init__(
         self,
-        signal: Signal | None = None,
-        strategy: Strategy | None = None,
+        strategy: Strategy,
         config: BacktestConfig | None = None,
         cost_model: CostModel | dict[str, CostModel] | None = None,
         sizer: Sizer | dict[str, Sizer] | None = None,
         stop_loss: StopLoss | dict[str, StopLoss] | None = None,
         symbol: str | None = None,
     ):
-        if signal is None and strategy is None:
-            raise ValueError("Provide either signal= or strategy=")
-        if signal is not None and strategy is not None:
-            raise ValueError("Provide signal= or strategy=, not both")
-
         self.config = config or BacktestConfig()
         self._cost_model_spec = cost_model
         self._sizer_spec = sizer
         self._stop_loss_spec = stop_loss
-
-        # If given a Signal, store it so run() can auto-wrap it
-        self._signal = signal
         self._strategy = strategy
         self._default_symbol = symbol or "ASSET"
 
@@ -344,28 +325,13 @@ class Backtester:
             raise ValueError("Provide data= or universe=, not both")
 
         if data is not None:
-            # Old API: single DataFrame → wrap into Universe
+            # Single DataFrame → wrap into Universe
             sym = self._default_symbol
             universe = Universe(symbols=[sym])
             universe.add_asset(sym, data, l2=l2)
-
-            if self._signal is not None:
-                strategy = SingleSignalStrategy(
-                    signal=self._signal, symbol=sym,
-                )
-            else:
-                strategy = self._strategy
+            strategy = self._strategy
         elif universe is not None:
-            if self._signal is not None:
-                # Signal + Universe → wrap signal for the first/specified symbol
-                sym = self._default_symbol
-                if sym == "ASSET" and universe.symbols:
-                    sym = universe.symbols[0]
-                strategy = SingleSignalStrategy(
-                    signal=self._signal, symbol=sym,
-                )
-            else:
-                strategy = self._strategy
+            strategy = self._strategy
         else:
             raise ValueError("Provide either data= or universe=")
 
@@ -386,6 +352,238 @@ class Backtester:
             timeframe=timeframe,
         )
 
+    # ── Vectorised fast-path helpers ──────────────────────────────────────
+
+    def _can_vectorize(
+        self,
+        symbols: list[str],
+        states: dict[str, _AssetState],
+        sizers: dict[str, Sizer],
+    ) -> bool:
+        """True when stops are all NopStopLoss and every sizer is vectorizable."""
+        from risk.stops import NopStopLoss
+        return (
+            all(isinstance(states[s].stop_loss, NopStopLoss) for s in symbols)
+            and all(sizers[s].vectorizable for s in symbols)
+        )
+
+    def _run_vectorized(
+        self,
+        t0: float,
+        sides_all: dict[str, np.ndarray],
+        weights_all: dict[str, np.ndarray],
+        universe: Universe,
+        symbols: list[str],
+        is_single_asset: bool,
+        bars_per_year: int | None,
+        timeframe: str | None,
+        index,
+        n_bars: int,
+        sizers: dict[str, Sizer],
+        cost_models: dict[str, CostModel],
+    ) -> BacktestResult:
+        """
+        Fully vectorised backtest — replaces the O(N) Python bar loop with
+        NumPy array operations when stops are NopStopLoss and sizers are
+        vectorizable.
+
+        Algorithm per symbol
+        --------------------
+        1. Detect entry / exit bars as transitions in the side array.
+        2. Compute entry prices, sizes, and fees for each trade (O(M) where
+           M = number of trades).
+        3. Build the equity curve without any bar iteration:
+           - Scatter entry-fee deductions and gross-PnL events onto their bars
+             with np.add.at, then cumsum to get realised equity.
+           - Forward-fill entry prices and sizes to every in-position bar using
+             np.maximum.accumulate, then compute unrealised PnL elementwise.
+           - equity[i] = initial_capital + cumsum_realised[i] + unrealised[i]
+        """
+        initial_capital = self.config.initial_capital
+
+        # Pre-extract close prices per symbol
+        _closes: dict[str, np.ndarray] = {}
+        for sym in symbols:
+            df = universe.ohlcv(sym)
+            locs = df.index.get_indexer(index)
+            vi = np.where(locs >= 0)[0]
+            arr = np.full(n_bars, np.nan)
+            arr[vi] = df["close"].values[locs[vi]]
+            _closes[sym] = arr
+
+        # Accumulate equity deltas across all symbols
+        equity_changes = np.zeros(n_bars)
+        all_trades: list[Trade] = []
+
+        if is_single_asset:
+            sym0 = symbols[0]
+            _sig_sides_arr = np.array(
+                [Side(int(v)).name for v in sides_all[sym0]], dtype=object
+            )
+            _pos_sides_arr = sides_all[sym0].astype(np.int8)
+
+        for sym in symbols:
+            sides   = sides_all[sym]      # (n_bars,) int8: 1, -1, 0
+            weights = weights_all[sym]    # (n_bars,) float64
+
+            closes = _closes[sym]
+            valid  = ~np.isnan(closes)
+
+            # Detect transitions: side changed from previous bar
+            prev = np.empty_like(sides)
+            prev[0] = 0
+            prev[1:] = sides[:-1]
+            changed = sides != prev
+
+            # Entry: side becomes non-zero at a bar with a valid price
+            entry_mask = changed & (sides != 0) & valid
+            # Close: side transitions FROM non-zero (includes flips)
+            close_mask = changed & (prev != 0)
+
+            entry_bars = np.where(entry_mask)[0]
+            close_bars_natural = np.where(close_mask)[0]
+
+            n_natural = len(close_bars_natural)
+            was_force_closed = len(entry_bars) > n_natural
+            close_bars = (
+                np.append(close_bars_natural, n_bars - 1)
+                if was_force_closed
+                else close_bars_natural
+            )
+
+            if len(entry_bars) == 0:
+                continue
+
+            entry_prices  = closes[entry_bars]
+            exit_prices   = closes[close_bars]
+            directions    = sides[entry_bars].astype(np.float64)
+            entry_weights = weights[entry_bars]
+
+            # ── Sizes ────────────────────────────────────────────────────
+            sizes = sizers[sym].compute_vectorized(
+                entry_prices, entry_weights, self.config
+            )
+            if is_single_asset:
+                max_notional = (
+                    initial_capital
+                    * self.config.max_position_pct
+                    * self.config.leverage
+                    * np.ones(len(entry_bars))
+                )
+            else:
+                max_notional = initial_capital * entry_weights * self.config.leverage
+            sizes = np.minimum(sizes, np.where(entry_prices > 0, max_notional / entry_prices, 0.0))
+            sizes = np.maximum(sizes, 0.0)
+
+            # ── Fees per trade (O(M), M << N) ────────────────────────────
+            # Pass the position's side for both entry and exit (matches sequential path)
+            entry_fees = np.array([
+                cost_models[sym].compute(ep, sz, Side(int(d)), self.config, None, {})
+                for ep, sz, d in zip(entry_prices, sizes, directions)
+            ])
+            exit_fees = np.array([
+                cost_models[sym].compute(xp, sz, Side(int(d)), self.config, None, {})
+                for xp, sz, d in zip(exit_prices, sizes, directions)
+            ])
+
+            gross_pnl = (exit_prices - entry_prices) * sizes * directions
+            net_pnl   = gross_pnl - entry_fees - exit_fees
+
+            # ── Equity curve (fully vectorised, no trade loop) ────────────
+            # Entry bars: deduct entry fee immediately
+            entry_fee_arr = np.zeros(n_bars)
+            np.add.at(entry_fee_arr, entry_bars, entry_fees)
+
+            # Close bars: add gross PnL minus exit fee
+            close_event_arr = np.zeros(n_bars)
+            np.add.at(close_event_arr, close_bars, gross_pnl - exit_fees)
+
+            cum_realized = np.cumsum(close_event_arr - entry_fee_arr)
+
+            # Unrealised PnL: forward-fill entry price and size to every in-position bar
+            # using np.maximum.accumulate on the "last entry bar seen so far" index.
+            last_entry_idx = np.where(entry_mask, np.arange(n_bars), 0)
+            np.maximum.accumulate(last_entry_idx, out=last_entry_idx)
+
+            ep_sparse   = np.zeros(n_bars)
+            sz_sparse   = np.zeros(n_bars)
+            np.add.at(ep_sparse, entry_bars, entry_prices)
+            np.add.at(sz_sparse, entry_bars, sizes)
+
+            in_pos = (sides != 0) & valid
+            # At force-close bars the strategy output hasn't transitioned to 0, so sides[bar]
+            # is still non-zero — but the position is exited at this bar's close.
+            # Exclude these from unrealized to prevent double-counting with the
+            # close event already scattered into close_event_arr.
+            if was_force_closed:
+                in_pos[close_bars[n_natural:]] = False
+
+            act_entry = np.where(in_pos, ep_sparse[last_entry_idx], 0.0)
+            act_size  = np.where(in_pos, sz_sparse[last_entry_idx], 0.0)
+            act_dir   = np.where(in_pos, sides.astype(np.float64), 0.0)
+
+            unrealized = (closes - act_entry) * act_size * act_dir
+            np.nan_to_num(unrealized, nan=0.0, copy=False)
+
+            equity_changes += cum_realized + unrealized
+
+            # ── Build Trade objects (O(M)) ────────────────────────────────
+            for k in range(len(entry_bars)):
+                is_forced = was_force_closed and k == len(entry_bars) - 1
+                notional  = float(entry_prices[k]) * float(sizes[k])
+                trade_meta = {"symbol": sym} if not is_single_asset else {}
+                all_trades.append(Trade(
+                    timestamp=index[int(entry_bars[k])],
+                    side=Side(int(directions[k])),
+                    size=float(sizes[k]),
+                    entry_price=float(entry_prices[k]),
+                    exit_price=float(exit_prices[k]),
+                    exit_timestamp=index[int(close_bars[k])],
+                    pnl=float(net_pnl[k]),
+                    pnl_pct=float(net_pnl[k] / notional) if notional > 0 else 0.0,
+                    fees=float(entry_fees[k] + exit_fees[k]),
+                    reason_exit="End of data" if is_forced else "strategy",
+                    meta=trade_meta,
+                ))
+
+        # ── Assemble result ───────────────────────────────────────────────
+        equity_arr = initial_capital + equity_changes
+        eq_series  = pd.Series(equity_arr, index=index, name="equity")
+
+        if is_single_asset:
+            pos_series = pd.Series(_pos_sides_arr, index=index, name="position")
+            sig_df = pd.DataFrame({
+                "timestamp":  index,
+                "side":       _sig_sides_arr,
+                "weight":     weights_all[sym0],
+                "confidence": np.zeros(n_bars),
+                "reason":     np.full(n_bars, "", dtype=object),
+            })
+        else:
+            all_trades.sort(key=lambda t: t.timestamp)
+            pos_series = pd.Series(np.zeros(n_bars, dtype=np.int8), index=index, name="position")
+            sig_df = pd.DataFrame()
+
+        meta: dict[str, Any] = {
+            "bars_per_year": bars_per_year,
+            "symbols": symbols,
+            "vectorized": True,
+        }
+        if timeframe is not None:
+            meta["timeframe"] = timeframe
+
+        return BacktestResult(
+            trades=all_trades,
+            equity_curve=eq_series,
+            positions=pos_series,
+            bar_log=sig_df,
+            config=self.config,
+            run_time_s=time.perf_counter() - t0,
+            meta=meta,
+            positions_log=None,
+            allocation_log=None,
+        )
+
     # ── Core loop ────────────────────────────────────────────────────────
 
     def _run_loop(
@@ -402,7 +600,6 @@ class Backtester:
         if n_bars == 0:
             raise ValueError("No data in universe")
 
-        # Use common index for multi-asset alignment
         if is_single_asset:
             index = universe.ohlcv(symbols[0]).index
         else:
@@ -411,7 +608,6 @@ class Backtester:
                 index = universe.ohlcv(symbols[0]).index
         n_bars = len(index)
 
-        # Infer annualisation
         if bars_per_year is None:
             if isinstance(index, pd.DatetimeIndex) and len(index) > 2:
                 median_delta = index.to_series().diff().median()
@@ -420,83 +616,133 @@ class Backtester:
             else:
                 bars_per_year = 8760
 
-        # Setup strategy (vectorised indicators)
         strategy.setup(universe)
 
-        # Per-asset state
         states: dict[str, _AssetState] = {}
         sizers: dict[str, Sizer] = {}
         cost_models: dict[str, CostModel] = {}
         for sym in symbols:
             states[sym] = _AssetState(
-                stop_loss=self._resolve(
-                    self._stop_loss_spec, sym, default_stop_loss,
-                ),
+                stop_loss=self._resolve(self._stop_loss_spec, sym, default_stop_loss),
             )
             sizers[sym] = self._resolve(self._sizer_spec, sym, default_sizer)
-            cost_models[sym] = self._resolve(
-                self._cost_model_spec, sym, CompositeCostModel,
-            )
+            cost_models[sym] = self._resolve(self._cost_model_spec, sym, CompositeCostModel)
 
-        # Pre-allocate
+        # ── Try vectorised fast path ──────────────────────────────────────
+        if self._can_vectorize(symbols, states, sizers):
+            batch = strategy.generate_all(universe)
+            if batch is not None:
+                sides_all, weights_all = batch
+                return self._run_vectorized(
+                    t0, sides_all, weights_all, universe, symbols,
+                    is_single_asset, bars_per_year, timeframe,
+                    index, n_bars, sizers, cost_models,
+                )
+
+        # ── Pre-extract OHLCV as numpy arrays (O(n) bulk alignment) ──────
+        # Replaces per-bar ohlcv.index.get_loc(ts) + ohlcv[col].iat[loc]
+        # with direct array indexing, eliminating O(n log n) overhead.
+        ohlcv_dfs: dict[str, pd.DataFrame] = {sym: universe.ohlcv(sym) for sym in symbols}
+
+        # _local_idx[sym][global_i] = local row index, -1 if symbol has no bar here
+        _local_idx: dict[str, np.ndarray] = {}
+        _has_bar: dict[str, np.ndarray] = {}
+        _closes: dict[str, np.ndarray] = {}
+        _opens: dict[str, np.ndarray] = {}
+        _highs: dict[str, np.ndarray] = {}
+        _lows: dict[str, np.ndarray] = {}
+        # All numeric columns (OHLCV + indicator columns from strategy.setup())
+        _col_arrays: dict[str, dict[str, np.ndarray]] = {}
+
+        for sym in symbols:
+            df = ohlcv_dfs[sym]
+            locs = df.index.get_indexer(index)   # single O(n) pass
+            valid = locs >= 0
+            vi = np.where(valid)[0]   # global bar positions with data
+            vl = locs[vi]             # corresponding local row positions
+
+            _local_idx[sym] = locs
+            _has_bar[sym] = valid
+
+            def _mk(col: str, _df=df, _vi=vi, _vl=vl) -> np.ndarray:
+                a = np.full(n_bars, np.nan)
+                a[_vi] = _df[col].values[_vl]
+                return a
+
+            _closes[sym] = _mk("close")
+            _opens[sym] = _mk("open")
+            _highs[sym] = _mk("high")
+            _lows[sym] = _mk("low")
+
+            col_dict: dict[str, np.ndarray] = {}
+            for col in df.columns:
+                if pd.api.types.is_numeric_dtype(df[col]):
+                    col_dict[col] = _mk(col)
+            _col_arrays[sym] = col_dict
+
+        # ── Pre-allocate output arrays ────────────────────────────────────
         equity_arr = np.full(n_bars, np.nan)
         equity = self.config.initial_capital
         equity_arr[0] = equity
 
-        # For single-asset backward compat: track position side per bar
-        pos_side_arr = np.zeros(n_bars, dtype=int) if is_single_asset else None
+        pos_side_arr = np.zeros(n_bars, dtype=np.int8) if is_single_asset else None
 
         all_trades: list[Trade] = []
         closed_trades: list[Trade] = []
-        signal_log_rows: list[dict] = []
-        alloc_log_rows: list[dict] = []
-        pos_log_rows: list[dict] = []
 
-        # ── Bar loop ─────────────────────────────────────────────────────
+        # Single-asset bar log: pre-allocated arrays avoid n_bars dict creations
+        if is_single_asset:
+            _sig_sides = np.empty(n_bars, dtype=object)
+            _sig_weights = np.zeros(n_bars, dtype=np.float64)
+            _sig_confidences = np.zeros(n_bars, dtype=np.float64)
+            _sig_reasons = np.empty(n_bars, dtype=object)
+            alloc_log_rows: list[dict] = []
+            pos_log_rows: list[dict] = []
+        else:
+            alloc_log_rows = []
+            pos_log_rows = []
+
+        # ── Bar loop ──────────────────────────────────────────────────────
 
         for i in range(n_bars):
             ts = index[i]
 
-            # Resolve bar-level data for each asset
+            # Build prices/locs/bar_dicts from pre-extracted arrays (O(1) per bar)
             prices: dict[str, float] = {}
+            bar_locs: dict[str, int] = {}
             bar_dicts: dict[str, dict] = {}
-            bar_locs: dict[str, int] = {}  # asset-local index
 
             for sym in symbols:
-                ohlcv = universe.ohlcv(sym)
-                if ts in ohlcv.index:
-                    loc = ohlcv.index.get_loc(ts)
-                    # get_loc can return a slice for duplicates; take first
-                    if isinstance(loc, slice):
-                        loc = loc.start
-                    prices[sym] = ohlcv["close"].iat[loc]
-                    bar_dicts[sym] = {
-                        c: ohlcv[c].iat[loc] for c in ohlcv.columns
-                        if np.isscalar(ohlcv[c].iat[loc])
-                    }
-                    bar_locs[sym] = loc
+                if not _has_bar[sym][i]:
+                    continue
+                loc = int(_local_idx[sym][i])
+                prices[sym] = float(_closes[sym][i])
+                bar_locs[sym] = loc
+                bar_dicts[sym] = {
+                    col: float(arr[i]) for col, arr in _col_arrays[sym].items()
+                }
 
-                    # Inject funding rate if available
-                    funding_snap = universe.funding_at(sym, loc)
-                    if funding_snap is not None:
-                        bar_dicts[sym]["funding_rate"] = funding_snap.rate
-                        bar_dicts[sym]["funding_rate_ann_bps"] = funding_snap.rate_annualized
-                        if funding_snap.oracle_price > 0:
-                            bar_dicts[sym]["oracle_price"] = funding_snap.oracle_price
-                        if funding_snap.mark_price > 0:
-                            bar_dicts[sym]["mark_price"] = funding_snap.mark_price
+                # Inject funding if available
+                funding_snap = universe.funding_at(sym, loc)
+                if funding_snap is not None:
+                    bar_dicts[sym]["funding_rate"] = funding_snap.rate
+                    bar_dicts[sym]["funding_rate_ann_bps"] = funding_snap.rate_annualized
+                    if funding_snap.oracle_price > 0:
+                        bar_dicts[sym]["oracle_price"] = funding_snap.oracle_price
+                    if funding_snap.mark_price > 0:
+                        bar_dicts[sym]["mark_price"] = funding_snap.mark_price
 
-            # ── Mark-to-market ───────────────────────────────────────────
+            # ── Mark-to-market ────────────────────────────────────────────
             for sym in symbols:
+                if sym not in prices:
+                    continue
                 st = states[sym]
                 pos = st.position
-                if pos.side != Side.FLAT and pos.size > 0 and sym in prices:
+                if pos.side != Side.FLAT and pos.size > 0:
                     direction = 1 if pos.side == Side.LONG else -1
-                    pos.unrealized_pnl = (
-                        (prices[sym] - pos.entry_price) * pos.size * direction
-                    )
+                    pos.unrealized_pnl = (prices[sym] - pos.entry_price) * pos.size * direction
 
-            # ── Stop-loss checks ─────────────────────────────────────────
+            # ── Stop-loss checks ──────────────────────────────────────────
             for sym in symbols:
                 st = states[sym]
                 pos = st.position
@@ -507,33 +753,26 @@ class Backtester:
                 if loc is None:
                     continue
 
-                ohlcv = universe.ohlcv(sym)
+                df = ohlcv_dfs[sym]
                 l2_list = universe.l2(sym)
                 l2_snap = l2_list[loc] if l2_list and loc < len(l2_list) else None
 
                 stop_ctx = StopContext(
                     position=pos,
                     bar_idx=loc,
-                    open=ohlcv["open"].iat[loc],
-                    high=ohlcv["high"].iat[loc],
-                    low=ohlcv["low"].iat[loc],
+                    open=float(_opens[sym][i]),
+                    high=float(_highs[sym][i]),
+                    low=float(_lows[sym][i]),
                     close=prices[sym],
-                    data=ohlcv,
+                    data=df,
                     l2=l2_snap,
                     bar_data=bar_dicts.get(sym, {}),
                 )
                 st.stop_loss.update(stop_ctx)
                 stop_result = st.stop_loss.check(stop_ctx)
 
-                # SignalStop backward compat (single-asset only)
-                if (
-                    not stop_result.triggered
-                    and is_single_asset
-                    and isinstance(st.stop_loss, SignalStop)
-                    and self._signal is not None
-                ):
-                    sig_peek = self._signal.generate(ohlcv, loc)
-                    st.stop_loss.set_levels(sig_peek.stop_loss, sig_peek.take_profit)
+                # EmbeddedStop: check allocation-embedded SL/TP levels
+                if not stop_result.triggered and isinstance(st.stop_loss, EmbeddedStop):
                     stop_result = st.stop_loss.check_with_levels(stop_ctx)
 
                 if stop_result.triggered:
@@ -547,7 +786,8 @@ class Backtester:
                         if pos.side == Side.LONG
                         else (pos.entry_price - exit_p) * pos.size
                     )
-                    pnl = raw_pnl - cost
+                    entry_fee = st.open_trade.fees if st.open_trade is not None else 0.0
+                    pnl = raw_pnl - cost - entry_fee
                     equity += pnl
 
                     if st.open_trade is not None:
@@ -569,7 +809,7 @@ class Backtester:
                     st.open_trade = None
                     st.stop_loss.reset()
 
-            # ── Generate strategy targets ────────────────────────────────
+            # ── Generate strategy targets ──────────────────────────────────
             ctx = StrategyContext(
                 universe=universe,
                 bar_idx=i,
@@ -580,17 +820,14 @@ class Backtester:
             )
             target = strategy.generate(ctx)
 
-            # Build signal log row (backward-compat for single asset)
+            # Record bar log into pre-allocated arrays (single-asset)
             if is_single_asset:
                 sym0 = symbols[0]
                 alloc = target[sym0]
-                signal_log_rows.append({
-                    "timestamp": ts,
-                    "side": alloc.side.name,
-                    "weight": alloc.weight,
-                    "confidence": alloc.confidence,
-                    "reason": alloc.reason,
-                })
+                _sig_sides[i] = alloc.side.name
+                _sig_weights[i] = alloc.weight
+                _sig_confidences[i] = alloc.confidence
+                _sig_reasons[i] = alloc.reason
             else:
                 row = {"timestamp": ts}
                 for sym in symbols:
@@ -609,11 +846,9 @@ class Backtester:
                     continue
 
                 desired = target[sym]
-                should_close = (
-                    desired.side == Side.FLAT
-                    or desired.side != pos.side
-                )
-                if not should_close or sym not in prices:
+                if desired.side != Side.FLAT and desired.side == pos.side:
+                    continue   # holding — no action
+                if sym not in prices:
                     continue
 
                 price = prices[sym]
@@ -621,7 +856,8 @@ class Backtester:
                     price, pos.size, pos.side, self.config,
                     None, bar_dicts.get(sym, {}),
                 )
-                pnl = pos.unrealized_pnl - cost
+                entry_fee = st.open_trade.fees if st.open_trade is not None else 0.0
+                pnl = pos.unrealized_pnl - cost - entry_fee
                 pnl_pct = (
                     pnl / (pos.entry_price * pos.size)
                     if pos.entry_price * pos.size > 0 else 0
@@ -637,12 +873,10 @@ class Backtester:
                     exit_timestamp=ts,
                     pnl=pnl,
                     pnl_pct=pnl_pct,
-                    fees=cost,
-                    reason_entry=(
-                        st.open_trade.reason_entry if st.open_trade else ""
-                    ),
+                    fees=entry_fee + cost,
+                    reason_entry=(st.open_trade.reason_entry if st.open_trade else ""),
                     reason_exit=desired.reason or "target_flat",
-                    signal_values=desired.meta,
+                    bar_values=desired.meta,
                     meta=trade_meta,
                 )
                 all_trades.append(trade)
@@ -653,22 +887,19 @@ class Backtester:
                 st.open_trade = None
                 st.stop_loss.reset()
 
-            # ── Open new positions ───────────────────────────────────────
+            # ── Open new positions ─────────────────────────────────────────
             for sym in symbols:
                 st = states[sym]
                 if st.position.side != Side.FLAT:
                     continue
 
                 alloc = target[sym]
-                if alloc.side == Side.FLAT or alloc.weight <= 0:
-                    continue
-                if sym not in prices:
+                if alloc.side == Side.FLAT or alloc.weight <= 0 or sym not in prices:
                     continue
 
                 price = prices[sym]
                 loc = bar_locs.get(sym, 0)
-                ohlcv = universe.ohlcv(sym)
-                sig_result = alloc.to_signal_result()
+                df = ohlcv_dfs[sym]
 
                 l2_list = universe.l2(sym)
                 l2_snap = l2_list[loc] if l2_list and loc < len(l2_list) else None
@@ -676,10 +907,10 @@ class Backtester:
                 sizing_ctx = SizingContext(
                     equity=equity,
                     price=price,
-                    signal=sig_result,
+                    allocation=alloc,
                     config=self.config,
                     position=st.position,
-                    data=ohlcv,
+                    data=df,
                     bar_idx=loc,
                     trade_history=closed_trades,
                     l2=l2_snap,
@@ -687,15 +918,10 @@ class Backtester:
                 )
                 size = sizers[sym].compute(sizing_ctx)
 
-                # Cap at max position (use allocation weight for multi-asset)
                 if is_single_asset:
-                    max_notional = (
-                        equity * self.config.max_position_pct * self.config.leverage
-                    )
+                    max_notional = equity * self.config.max_position_pct * self.config.leverage
                 else:
-                    max_notional = (
-                        equity * alloc.weight * self.config.leverage
-                    )
+                    max_notional = equity * alloc.weight * self.config.leverage
                 max_size = max_notional / price if price > 0 else 0
                 size = min(size, max_size)
 
@@ -713,21 +939,24 @@ class Backtester:
                     entry_price=price,
                     entry_timestamp=ts,
                 )
-                equity -= cost
 
-                # Initialize stop
+                o_i = float(_opens[sym][i])
+                h_i = float(_highs[sym][i])
+                l_i = float(_lows[sym][i])
                 stop_ctx = StopContext(
                     position=st.position,
                     bar_idx=loc,
-                    open=ohlcv["open"].iat[loc] if loc < len(ohlcv) else price,
-                    high=ohlcv["high"].iat[loc] if loc < len(ohlcv) else price,
-                    low=ohlcv["low"].iat[loc] if loc < len(ohlcv) else price,
+                    open=o_i if not np.isnan(o_i) else price,
+                    high=h_i if not np.isnan(h_i) else price,
+                    low=l_i if not np.isnan(l_i) else price,
                     close=price,
-                    data=ohlcv,
+                    data=df,
                     l2=l2_snap,
                     bar_data=bar_dicts.get(sym, {}),
                 )
                 st.stop_loss.on_entry(st.position, stop_ctx)
+                if isinstance(st.stop_loss, EmbeddedStop):
+                    st.stop_loss.set_levels(alloc.stop_loss, alloc.take_profit)
 
                 trade_meta = {"symbol": sym} if not is_single_asset else {}
                 trade = Trade(
@@ -737,13 +966,13 @@ class Backtester:
                     entry_price=price,
                     fees=cost,
                     reason_entry=alloc.reason,
-                    signal_values=alloc.meta,
+                    bar_values=alloc.meta,
                     meta=trade_meta,
                 )
                 all_trades.append(trade)
                 st.open_trade = trade
 
-            # ── Record state ─────────────────────────────────────────────
+            # ── Record equity ──────────────────────────────────────────────
             unrealized = sum(
                 st.position.unrealized_pnl
                 for st in states.values()
@@ -761,7 +990,7 @@ class Backtester:
                     row[f"{sym}_size"] = st.position.size
                 pos_log_rows.append(row)
 
-        # ── Force-close remaining positions ──────────────────────────────
+        # ── Force-close remaining positions ───────────────────────────────
         last_ts = index[-1]
         for sym in symbols:
             st = states[sym]
@@ -769,20 +998,24 @@ class Backtester:
             if pos.side == Side.FLAT:
                 continue
 
-            last_ohlcv = universe.ohlcv(sym)
-            last_price = last_ohlcv["close"].iloc[-1]
+            last_close = float(_closes[sym][-1])
+            if np.isnan(last_close):
+                last_close = float(ohlcv_dfs[sym]["close"].iloc[-1])
+
             cost = cost_models[sym].compute(
-                last_price, pos.size, pos.side, self.config, None, None,
+                last_close, pos.size, pos.side, self.config, None, None,
             )
             raw_pnl = (
-                (last_price - pos.entry_price) * pos.size
+                (last_close - pos.entry_price) * pos.size
                 if pos.side == Side.LONG
-                else (pos.entry_price - last_price) * pos.size
+                else (pos.entry_price - last_close) * pos.size
             )
-            pnl = raw_pnl - cost
+            entry_fee = st.open_trade.fees if st.open_trade is not None else 0.0
+            pnl = raw_pnl - cost - entry_fee
+            equity += pnl  # track force-close in equity so equity_arr[-1] is correct below
 
             if st.open_trade is not None:
-                st.open_trade.exit_price = last_price
+                st.open_trade.exit_price = last_close
                 st.open_trade.exit_timestamp = last_ts
                 st.open_trade.pnl = pnl
                 st.open_trade.pnl_pct = (
@@ -801,7 +1034,7 @@ class Backtester:
                     side=pos.side,
                     size=pos.size,
                     entry_price=pos.entry_price,
-                    exit_price=last_price,
+                    exit_price=last_close,
                     exit_timestamp=last_ts,
                     pnl=pnl,
                     pnl_pct=(
@@ -815,13 +1048,18 @@ class Backtester:
                 all_trades.append(trade)
                 closed_trades.append(trade)
 
-        # ── Build result ─────────────────────────────────────────────────
+        # After force-closes, update equity_arr[-1] to reflect the true realized
+        # equity (exit fees now deducted). Without this, equity_arr[-1] would show
+        # mark-to-market + unrealized from the bar loop, which omits the exit fees
+        # of positions that were force-closed after the loop.
+        equity_arr[-1] = equity
+
+        # ── Build result ──────────────────────────────────────────────────
         final_trades = [t for t in all_trades if t.exit_price is not None]
         elapsed = time.perf_counter() - t0
 
         eq_series = pd.Series(equity_arr, index=index, name="equity")
 
-        # positions Series (backward compat for single-asset)
         if is_single_asset:
             pos_series = pd.Series(pos_side_arr, index=index, name="position")
         else:
@@ -836,9 +1074,15 @@ class Backtester:
                     np.zeros(n_bars, dtype=int), index=index, name="position",
                 )
 
-        # signal_log (backward compat: single-asset uses per-bar rows)
+        # Build bar log from pre-allocated arrays (avoids n_bars dict constructions)
         if is_single_asset:
-            sig_df = pd.DataFrame(signal_log_rows)
+            sig_df = pd.DataFrame({
+                "timestamp": index,
+                "side": _sig_sides,
+                "weight": _sig_weights,
+                "confidence": _sig_confidences,
+                "reason": _sig_reasons,
+            })
         else:
             sig_df = pd.DataFrame(alloc_log_rows) if alloc_log_rows else pd.DataFrame()
 
@@ -850,7 +1094,7 @@ class Backtester:
             trades=final_trades,
             equity_curve=eq_series,
             positions=pos_series,
-            signal_log=sig_df,
+            bar_log=sig_df,
             config=self.config,
             run_time_s=elapsed,
             meta=meta,

@@ -40,8 +40,7 @@ from risk.sizing import Sizer, SizingContext, default_sizer
 from risk.stops import StopLoss, StopContext, default_stop_loss
 from risk.limits import DailyLimitState, check_daily_loss_limit
 
-from strategy.base import Signal, Strategy, StrategyContext
-from strategy.built_in import SingleSignalStrategy
+from strategy.base import Strategy, StrategyContext
 from strategy.universe import Universe
 
 from .base_executor_feed import BaseExecutor, FillResult
@@ -113,32 +112,21 @@ class LiveEngine:
     """
     Single-exchange live engine.
 
-    Accepts either signal= (legacy single-asset) or strategy= (multi-asset).
     Instantiates executor/feed via factory so config.exchange = "binance"
     works without any code changes.
     """
 
     def __init__(
         self,
-        signal: Signal | None = None,
-        strategy: Strategy | None = None,
+        strategy: Strategy,
         config: LiveConfig | None = None,
         sizer: Sizer | dict[str, Sizer] | None = None,
         stop_loss: StopLoss | dict[str, StopLoss] | None = None,
     ):
-        if signal is None and strategy is None:
-            raise ValueError("Provide either signal= or strategy=")
-        if signal is not None and strategy is not None:
-            raise ValueError("Provide signal= or strategy=, not both")
-
         self.config = config or LiveConfig()
         self._sizer_spec = sizer
         self._stop_loss_spec = stop_loss
-
-        if signal is not None:
-            self.strategy = SingleSignalStrategy(signal=signal, symbol=self.config.symbol)
-        else:
-            self.strategy = strategy
+        self.strategy = strategy
 
         self._symbols = self.config.active_symbols
         self._is_single = len(self._symbols) == 1
@@ -445,7 +433,7 @@ class LiveEngine:
             sizer_cfg = _sizer_config_shim(self.config, self.state.equity)
             sizing_ctx = SizingContext(
                 equity=self.state.equity, price=price,
-                signal=alloc.to_signal_result(), config=sizer_cfg,
+                allocation=alloc, config=sizer_cfg,
                 position=pos, data=df, bar_idx=idx,
                 trade_history=self.state.closed_trades,
                 l2=l2_snap, bar_data=bar_dict,
@@ -486,7 +474,7 @@ class LiveEngine:
                     size=fill.filled_size or size,
                     entry_price=fill.fill_price or price,
                     reason_entry=alloc.reason,
-                    signal_values=alloc.meta,
+                    bar_values=alloc.meta,
                     meta={"symbol": sym, "exchange": self.config.exchange},
                 )
                 self.state.trades.append(trade)

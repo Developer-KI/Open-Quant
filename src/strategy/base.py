@@ -1,15 +1,14 @@
 """
-strategy/base.py — Abstract Strategy base and PortfolioTarget.
-
-A Strategy is the multi-asset generalization of Signal.  Where a Signal
-operates on one DataFrame and returns a SignalResult, a Strategy sees an
-entire Universe (all assets + auxiliary data) and returns a PortfolioTarget
-mapping each asset to its desired allocation.
+strategy/base.py — Abstract Strategy base, PortfolioTarget, and SingleAssetStrategy.
 
 The engine calls:
-  1. strategy.setup(universe)             — once, to pre-compute indicators
-  2. strategy.generate(ctx) per bar       — returns PortfolioTarget
-  3. engine rebalances positions to match  — per-asset sizing, stops, costs
+  1. strategy.setup(universe)        — once, to pre-compute indicators
+  2. strategy.generate(ctx) per bar  — returns PortfolioTarget
+  3. engine rebalances positions to match per-asset sizing, stops, costs
+
+SingleAssetStrategy is a convenience base for strategies that trade one symbol.
+Subclass it, implement `bar(data, idx) -> Allocation`, and optionally override
+`setup_data(data, l2)`.  Everything else is auto-wired.
 """
 
 from __future__ import annotations
@@ -18,132 +17,14 @@ import abc
 from dataclasses import dataclass, field
 from typing import Any
 
+import numpy as np
 import pandas as pd
 
-from core.models import Side, OrderBookSnapshot, Position, FundingSnapshot, SignalResult
+from core.models import Side, OrderBookSnapshot, Position, FundingSnapshot, Allocation
 from .universe import Universe
 
 
 # ── Portfolio target ─────────────────────────────────────────────────────────
-
-"""
-signal.py — Abstract Signal base class and concrete examples.
-
-Every strategy is a Signal subclass.  The contract:
-  1. `setup(data, config)`   — pre-compute indicators (vectorized).
-  2. `generate(data, index)` — return a SignalResult per bar.
-  3. `params()`              — dict of tunable parameters (for stress tests).
-
-The registry decorator lets you look up signals by name string.
-"""
-
-# ── Signal registry ──────────────────────────────────────────────────────────
-
-_SIGNAL_REGISTRY: dict[str, type[Signal]] = {}
-
-
-def register_signal(name: str):
-    """Class decorator: ``@register_signal("my_signal")``."""
-
-    def _wrap(cls):
-        _SIGNAL_REGISTRY[name] = cls
-        cls._registry_name = name
-        return cls
-
-    return _wrap
-
-
-def get_signal(name: str) -> type[Signal]:
-    if name not in _SIGNAL_REGISTRY:
-        raise KeyError(
-            f"Signal '{name}' not registered. Available: {list(_SIGNAL_REGISTRY)}"
-        )
-    return _SIGNAL_REGISTRY[name]
-
-
-def list_signals() -> list[str]:
-    return list(_SIGNAL_REGISTRY.keys())
-
-
-# SignalResult is now defined in core/models.py and re-exported here for
-# backward compatibility. Any code doing `from strategy.base import SignalResult`
-# continues to work unchanged.
-# (SignalResult imported above from core.models)
-
-
-# ── Abstract base ────────────────────────────────────────────────────────────
-
-
-class Signal(abc.ABC):
-    """
-    Base class for all trading signals.
-
-    Subclass and implement:
-      • setup()    — vectorized indicator pre-computation
-      • generate() — per-bar signal logic (called in the hot loop)
-      • params     — property returning the tunable parameter dict
-    """
-
-    _registry_name: str = ""
-
-    def __init__(self, **kwargs):
-        # Store any constructor kwargs as attributes for easy param sweeps
-        for k, v in kwargs.items():
-            setattr(self, k, v)
-
-    # ── lifecycle ────────────────────────────────────────────────────────
-    @abc.abstractmethod
-    def setup(self, data: pd.DataFrame, l2: list[OrderBookSnapshot] | None = None):
-        """
-        Pre-compute columns/arrays on `data` **in-place**.
-        Called once before the backtest loop.
-        `l2` is an optional list of OrderBookSnapshots aligned to data index.
-        """
-        ...
-
-    @abc.abstractmethod
-    def generate(self, data: pd.DataFrame, idx: int) -> SignalResult:
-        """Return the signal decision for bar ``idx``."""
-        ...
-
-    @property
-    @abc.abstractmethod
-    def params(self) -> dict[str, Any]:
-        """Return a dict of the current tunable parameters."""
-        ...
-
-    def set_params(self, new: dict[str, Any]):
-        for k, v in new.items():
-            if hasattr(self, k):
-                setattr(self, k, v)
-
-
-@dataclass
-class Allocation:
-    """Desired state for one asset."""
-    side: Side = Side.FLAT
-    weight: float = 0.0          # 0..1 fraction of portfolio to allocate
-    confidence: float = 0.0      # 0..1 conviction (passed to sizer)
-    reason: str = ""
-    order_type: str = "market"
-    limit_price: float | None = None
-    stop_loss: float | None = None
-    take_profit: float | None = None
-    meta: dict[str, Any] = field(default_factory=dict)
-
-    def to_signal_result(self) -> SignalResult:
-        """Convert to a SignalResult for compatibility with sizers/stops."""
-        return SignalResult(
-            target_side=self.side,
-            target_weight=self.weight,
-            confidence=self.confidence,
-            reason=self.reason,
-            order_type=self.order_type,
-            limit_price=self.limit_price,
-            stop_loss=self.stop_loss,
-            take_profit=self.take_profit,
-            meta=self.meta,
-        )
 
 
 @dataclass
@@ -295,12 +176,96 @@ class Strategy(abc.ABC):
             if hasattr(self, k):
                 setattr(self, k, v)
 
+    def generate_all(
+        self, universe: Universe
+    ) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray]] | None:
+        """
+        Optional batch generation for all bars at once.
+
+        Returns ``(sides, weights)`` where:
+          - ``sides[sym]``   — ``int8`` array of Side values per bar
+          - ``weights[sym]`` — ``float64`` array of allocation weights per bar
+
+        The engine activates the vectorised fast path when this returns non-``None``
+        **and** all stops are :class:`~risk.stops.NopStopLoss` **and** all sizers
+        are :attr:`~risk.sizing.Sizer.vectorizable`.
+
+        Return ``None`` (default) to fall back to the per-bar :meth:`generate` path.
+        """
+        return None
+
     def on_fill(self, symbol: str, side: Side, size: float, price: float):
         """Optional callback when a fill occurs (for bookkeeping)."""
         pass
 
 
-# ── Strategy registry (mirrors Signal registry) ─────────────────────────────
+# ── SingleAssetStrategy — convenience base replacing Signal ─────────────────
+
+
+class SingleAssetStrategy(Strategy):
+    """
+    Convenience base for single-asset strategies.
+
+    Implement ``bar(data, idx) -> Allocation`` and optionally override
+    ``setup_data(data, l2)`` for indicator pre-computation.
+    ``setup``, ``generate``, and ``generate_all`` are auto-wired.
+
+    Migration from the old Signal API:
+      Signal.setup(data, l2)         →  SingleAssetStrategy.setup_data(data, l2)
+      Signal.generate(data, idx)     →  SingleAssetStrategy.bar(data, idx)
+      @register_signal("name")       →  @register_strategy("name")
+      SignalResult(target_side=...,  →  Allocation(side=..., weight=...)
+                   target_weight=...)
+    """
+
+    def __init__(self, symbol: str, **kw):
+        super().__init__(**kw)
+        self.symbol = symbol
+
+    def setup_data(
+        self, data: pd.DataFrame, l2: list[OrderBookSnapshot] | None = None
+    ):
+        """Optional: pre-compute indicator columns on data in-place."""
+        pass
+
+    @abc.abstractmethod
+    def bar(self, data: pd.DataFrame, idx: int) -> Allocation:
+        """Return the desired allocation for bar ``idx``."""
+        ...
+
+    # ── Auto-wired — generally do not override ──────────────────────────
+
+    def setup(self, universe: Universe):
+        data = universe.ohlcv(self.symbol)
+        l2 = universe.l2(self.symbol)
+        self.setup_data(data, l2)
+
+    def generate(self, ctx: StrategyContext) -> PortfolioTarget:
+        data = ctx.universe.ohlcv(self.symbol)
+        alloc = self.bar(data, ctx.bar_idx)
+        target = PortfolioTarget(timestamp=ctx.timestamp)
+        target[self.symbol] = alloc
+        return target
+
+    def generate_all(
+        self, universe: Universe
+    ) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray]] | None:
+        data = universe.ohlcv(self.symbol)
+        n = len(data)
+        sides = np.zeros(n, dtype=np.int8)
+        weights = np.zeros(n, dtype=np.float64)
+        for i in range(n):
+            a = self.bar(data, i)
+            sides[i] = np.int8(a.side.value)
+            weights[i] = a.weight
+        return {self.symbol: sides}, {self.symbol: weights}
+
+    @property
+    def params(self) -> dict[str, Any]:
+        return {}
+
+
+# ── Strategy registry ────────────────────────────────────────────────────────
 
 
 _STRATEGY_REGISTRY: dict[str, type[Strategy]] = {}
@@ -325,54 +290,6 @@ def get_strategy(name: str) -> type[Strategy]:
 
 def list_strategies() -> list[str]:
     return list(_STRATEGY_REGISTRY.keys())
-
-"""
-strategy/cross_exchange.py — Multi-exchange strategy primitives.
-
-Extends the single-exchange Strategy/PortfolioTarget with types that
-see and route across multiple exchanges simultaneously.
-
-Three main concepts:
-
-  CrossExchangeStrategy
-      ABC that sees ALL exchanges and generates a MultiExchangeTarget
-      mapping (exchange, symbol) → Allocation.  For funding arb, stat arb,
-      cross-exchange hedging, etc.
-
-  MultiExchangeTarget
-      The output of a CrossExchangeStrategy.  Each allocation is keyed by
-      (exchange_name, symbol) so the engine knows exactly where to route.
-
-  CrossExchangeContext
-      Everything a CrossExchangeStrategy sees per bar: all universes,
-      per-exchange positions and equity, the shared MultiExchangePortfolio.
-
-  PortfolioOverlay
-      Optional risk layer that sits on top of per-exchange strategies.
-      After each exchange's strategy generates its PortfolioTarget, the
-      overlay can veto, scale, or hedge allocations for cross-exchange
-      constraints (max net exposure, delta-neutral enforcement, etc.).
-
-Usage (cross-exchange strategy):
-    class FundingArb(CrossExchangeStrategy):
-        def generate(self, ctx):
-            target = MultiExchangeTarget(timestamp=ctx.timestamp)
-            target["hyperliquid", "ETH"] = Allocation(side=Side.LONG, ...)
-            target["binance", "ETH"]     = Allocation(side=Side.SHORT, ...)
-            return target
-
-Usage (per-exchange strategies + overlay):
-    strategies = {
-        "hyperliquid": MomentumStrategy(...),
-        "binance":     MeanReversionStrategy(...),
-    }
-    overlay = NetExposureCap(max_net_pct=0.3)
-    engine = MultiExchangeEngine(
-        per_exchange_strategies=strategies,
-        overlay=overlay,
-        config=config,
-    )
-"""
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -662,4 +579,3 @@ def get_cross_strategy(name: str) -> type[CrossExchangeStrategy]:
 
 def list_cross_strategies() -> list[str]:
     return list(_CROSS_STRATEGY_REGISTRY.keys())
-

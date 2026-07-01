@@ -1,11 +1,14 @@
 """
-strategy/adapters.py — Bridge between old Signal and new Strategy APIs.
+strategy/built_in.py — Built-in strategy implementations.
 
-SingleSignalStrategy wraps any existing Signal so it works inside the
-multi-asset engine.  This means you never need to rewrite your old signals —
-just wrap them.
+Single-asset:
+  CompositeStrategy   — combine multiple SingleAssetStrategy instances with
+                        weighted voting (registered as "composite")
 
-Also contains useful multi-asset strategy templates.
+Multi-asset:
+  PerAssetStrategy    — run a different SingleAssetStrategy per symbol
+  ZPairsSpreadStrategy, CrossAssetMomentumStrategy,
+  MeanReversionBasketStrategy — pure Strategy subclasses
 """
 
 from __future__ import annotations
@@ -13,42 +16,50 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from core.models import Side
+from core.models import Side, Allocation
 from strategy.indicators import rsi
 
 from .base import (
-    register_signal, 
-    Signal, 
-    SignalResult,
+    SingleAssetStrategy,
     Strategy,
     StrategyContext,
     PortfolioTarget,
-    Allocation,
     register_strategy,
 )
 from .universe import Universe
 
 
+# ── Composite single-asset strategy ─────────────────────────────────────────
 
-@register_signal("composite")
-class CompositeSignal(Signal):
+
+@register_strategy("composite")
+class CompositeStrategy(SingleAssetStrategy):
     """
-    Combine multiple signals with weighted voting.
+    Combine multiple single-asset strategies with weighted voting.
+
+    Each child strategy's ``bar()`` is called; their ``side * confidence``
+    scores are summed with per-strategy weights.  If the aggregate exceeds
+    ``threshold`` in either direction, the position is entered.
 
     Usage:
-        comp = CompositeSignal(signals=[sig_a, sig_b], weights=[0.6, 0.4])
+        comp = CompositeStrategy(
+            symbol="BTC",
+            strategies=[ema_cross, rsi_strat],
+            weights=[0.6, 0.4],
+        )
     """
 
     def __init__(
         self,
-        signals: list[Signal] | None = None,
+        symbol: str,
+        strategies: list[SingleAssetStrategy] | None = None,
         weights: list[float] | None = None,
         threshold: float = 0.5,
         **kw,
     ):
-        super().__init__(**kw)
-        self.signals = signals or []
-        self.weights = weights or [1.0 / len(self.signals)] * len(self.signals)
+        super().__init__(symbol=symbol, **kw)
+        self.strategies = strategies or []
+        self.weights = weights or [1.0 / len(self.strategies)] * len(self.strategies)
         self.threshold = threshold
 
     @property
@@ -56,121 +67,78 @@ class CompositeSignal(Signal):
         return {
             "threshold": self.threshold,
             "weights": self.weights,
-            **{f"sub_{i}": s.params for i, s in enumerate(self.signals)},
+            **{f"sub_{i}": s.params for i, s in enumerate(self.strategies)},
         }
 
-    def setup(self, data: pd.DataFrame, l2=None):
-        for sig in self.signals:
-            sig.setup(data, l2)
+    def setup_data(self, data: pd.DataFrame, l2=None):
+        for s in self.strategies:
+            s.setup_data(data, l2)
 
-    def generate(self, data: pd.DataFrame, idx: int) -> SignalResult:
+    def bar(self, data: pd.DataFrame, idx: int) -> Allocation:
         score = 0.0
         reasons = []
-        for sig, w in zip(self.signals, self.weights):
-            r = sig.generate(data, idx)
-            score += r.target_side.value * r.confidence * w
-            if r.reason:
-                reasons.append(f"[{sig._registry_name}] {r.reason}")
+        for s, w in zip(self.strategies, self.weights):
+            a = s.bar(data, idx)
+            score += a.side.value * a.confidence * w
+            if a.reason:
+                reasons.append(f"[{s.__class__.__name__}] {a.reason}")
 
         if score > self.threshold:
-            return SignalResult(
-                target_side=Side.LONG,
-                target_weight=min(abs(score), 1.0),
+            return Allocation(
+                side=Side.LONG,
+                weight=min(abs(score), 1.0),
                 confidence=abs(score),
                 reason=" | ".join(reasons),
             )
         elif score < -self.threshold:
-            return SignalResult(
-                target_side=Side.SHORT,
-                target_weight=min(abs(score), 1.0),
+            return Allocation(
+                side=Side.SHORT,
+                weight=min(abs(score), 1.0),
                 confidence=abs(score),
                 reason=" | ".join(reasons),
             )
-        return SignalResult(reason=f"Composite score={score:.3f} below threshold")
+        return Allocation(reason=f"Composite score={score:.3f} below threshold")
 
 
-# ── Backward-compat adapter ─────────────────────────────────────────────────
-class SingleSignalStrategy(Strategy):
+# ── Multi-asset per-symbol strategy ─────────────────────────────────────────
+
+
+class PerAssetStrategy(Strategy):
     """
-    Wraps an existing Signal to run on one asset inside the multi-asset engine.
+    Run a different SingleAssetStrategy on each asset independently.
 
     Usage:
-        from signals.base import get_signal
-        MySignal = get_signal("my_signal")
-        strategy = SingleSignalStrategy(signal=MySignal(), symbol="ETH")
-    """
-
-    def __init__(self, signal: Signal, symbol: str, **kwargs):
-        super().__init__(**kwargs)
-        self.signal = signal
-        self.symbol = symbol
-
-    @property
-    def params(self) -> dict:
-        return {"symbol": self.symbol, "signal": self.signal.params}
-
-    def setup(self, universe: Universe):
-        data = universe.ohlcv(self.symbol)
-        l2 = universe.l2(self.symbol)
-        self.signal.setup(data, l2)
-
-    def generate(self, ctx: StrategyContext) -> PortfolioTarget:
-        data = ctx.universe.ohlcv(self.symbol)
-        sig = self.signal.generate(data, ctx.bar_idx)
-        target = PortfolioTarget(timestamp=ctx.timestamp)
-        target[self.symbol] = Allocation(
-            side=sig.target_side,
-            weight=sig.target_weight,
-            confidence=sig.confidence,
-            reason=sig.reason,
-            order_type=sig.order_type,
-            limit_price=sig.limit_price,
-            stop_loss=sig.stop_loss,
-            take_profit=sig.take_profit,
-            meta=sig.meta,
-        )
-        return target
-
-
-# ── Multi-signal per-asset strategy ──────────────────────────────────────────
-
-
-class PerAssetSignalStrategy(Strategy):
-    """
-    Run a different Signal on each asset independently.
-
-    Usage:
-        strategy = PerAssetSignalStrategy(
-            signals={"ETH": eth_signal, "BTC": btc_signal, "SOL": sol_signal},
+        strategy = PerAssetStrategy(
+            strategies={"ETH": eth_strategy, "BTC": btc_strategy},
         )
     """
 
-    def __init__(self, signals: dict[str, Signal], **kwargs):
+    def __init__(self, strategies: dict[str, SingleAssetStrategy], **kwargs):
         super().__init__(**kwargs)
-        self.signals = signals
+        self.strategies = strategies
 
     @property
     def params(self) -> dict:
-        return {sym: sig.params for sym, sig in self.signals.items()}
+        return {sym: s.params for sym, s in self.strategies.items()}
 
     def setup(self, universe: Universe):
-        for sym, sig in self.signals.items():
+        for sym, s in self.strategies.items():
             data = universe.ohlcv(sym)
             l2 = universe.l2(sym)
-            sig.setup(data, l2)
+            s.setup_data(data, l2)
 
     def generate(self, ctx: StrategyContext) -> PortfolioTarget:
         target = PortfolioTarget(timestamp=ctx.timestamp)
-        n_assets = len(self.signals)
-        for sym, sig in self.signals.items():
+        n_assets = len(self.strategies)
+        for sym, s in self.strategies.items():
             data = ctx.universe.ohlcv(sym)
-            result = sig.generate(data, ctx.bar_idx)
+            alloc = s.bar(data, ctx.bar_idx)
             target[sym] = Allocation(
-                side=result.target_side,
-                weight=result.target_weight / max(n_assets, 1),
-                confidence=result.confidence,
-                reason=f"[{sym}] {result.reason}",
-                meta=result.meta,
+                side=alloc.side,
+                weight=alloc.weight / max(n_assets, 1),
+                confidence=alloc.confidence,
+                reason=f"[{sym}] {alloc.reason}",
+                meta=alloc.meta,
             )
         return target
 
@@ -190,7 +158,7 @@ class ZPairsSpreadStrategy(Strategy):
     exits when z crosses zero.
 
     Usage:
-        strategy = PairsSpreadStrategy(
+        strategy = ZPairsSpreadStrategy(
             asset_a="ETH", asset_b="BTC",
             lookback=60, entry_z=2.0, exit_z=0.5,
         )
@@ -245,7 +213,6 @@ class ZPairsSpreadStrategy(Strategy):
         half_w = self.weight / 2
 
         if z < -self.entry_z:
-            # Spread too low → long A, short B (expect convergence)
             target[self.asset_a] = Allocation(
                 side=Side.LONG,
                 weight=half_w,
@@ -259,7 +226,6 @@ class ZPairsSpreadStrategy(Strategy):
                 reason=f"Pairs z={z:.2f} < -{self.entry_z}",
             )
         elif z > self.entry_z:
-            # Spread too high → short A, long B
             target[self.asset_a] = Allocation(
                 side=Side.SHORT,
                 weight=half_w,
@@ -273,7 +239,6 @@ class ZPairsSpreadStrategy(Strategy):
                 reason=f"Pairs z={z:.2f} > {self.entry_z}",
             )
         elif abs(z) < self.exit_z:
-            # Converged — flatten both legs
             target[self.asset_a] = Allocation(
                 reason=f"Pairs z={z:.2f} within exit band",
             )
@@ -333,7 +298,6 @@ class CrossAssetMomentumStrategy(Strategy):
         if ctx.bar_idx < self.min_bars:
             return target
 
-        # Compute momentum for each asset
         scores = {}
         for sym in self._symbols:
             ohlcv = ctx.universe.ohlcv(sym)
@@ -345,7 +309,6 @@ class CrossAssetMomentumStrategy(Strategy):
         if not scores:
             return target
 
-        # Rank by momentum
         ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
 
         long_assets = ranked[: self.long_n]
@@ -458,5 +421,3 @@ class MeanReversionBasketStrategy(Strategy):
 
         target.normalize(self.max_total_weight)
         return target
-    
-

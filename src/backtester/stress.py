@@ -2,17 +2,13 @@
 stress.py — Modular stress testing framework.
 
 Five types of stress tests:
-  1. SignalStressTest      — sweep signal parameters, find fragile combos
-  2. CostStressTest        — sweep cost assumptions (fees, slippage, impact)
-  3. RegimeStressTest      — test across market regime subsets (vol, trend, etc.)
-  4. MonteCarloStress      — bootstrap / shuffle trades to build confidence intervals
-  5. StrategyStressTest    — sweep strategy parameters (multi-asset analogue of SignalStressTest)
+  1. ParamSweep       — sweep SingleAssetStrategy parameters (grid or random)
+  2. CostStressTest   — sweep cost assumptions (fees, slippage, impact)
+  3. RegimeStressTest — test across market regime subsets (vol, trend, etc.)
+  4. MonteCarloStress — bootstrap / shuffle trades to build confidence intervals
+  5. StrategyStressTest — sweep Strategy parameters (multi-asset)
 
 All tests return a StressResult with a summary DataFrame and optional plots.
-
-CostStressTest and RegimeStressTest accept either:
-  • signal + data + l2    (old single-asset API, backwards compatible)
-  • strategy + universe   (new multi-asset API)
 """
 
 from __future__ import annotations
@@ -25,11 +21,11 @@ from typing import Any, Callable
 import numpy as np
 import pandas as pd
 
-from core.models import BacktestConfig, OrderBookSnapshot
+from core.models import BacktestConfig
 from .costs import CostModel, CompositeCostModel
 from .engine import Backtester, BacktestResult
 
-from strategy.base import Signal, Strategy
+from strategy.base import SingleAssetStrategy, Strategy
 from strategy.universe import Universe
 
 
@@ -94,26 +90,26 @@ def _run_backtester(
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# 1. Signal parameter stress test
+# 1. Parameter sweep (single-asset strategy)
 # ═══════════════════════════════════════════════════════════════════════════
 
 
-class SignalStressTest:
+class ParamSweep:
     """
-    Grid/random sweep over signal parameters.
+    Grid/random sweep over SingleAssetStrategy parameters.
 
     Usage:
-        sst = SignalStressTest(
-            signal_cls=EMACrossoverSignal,
+        sweep = ParamSweep(
+            strategy_cls=EMACrossStrategy,
             param_grid={"fast": [5, 8, 12, 20], "slow": [21, 26, 50]},
         )
-        result = sst.run(data)
+        result = sweep.run(universe=universe, timeframe="1h")
         result.plot_heatmap("fast", "slow")
     """
 
     def __init__(
         self,
-        signal_cls: type[Signal],
+        strategy_cls: type[SingleAssetStrategy],
         param_grid: dict[str, list],
         config: BacktestConfig | None = None,
         cost_model: CostModel | None = None,
@@ -121,7 +117,7 @@ class SignalStressTest:
         n_random: int | None = None,
         seed: int = 42,
     ):
-        self.signal_cls = signal_cls
+        self.strategy_cls = strategy_cls
         self.param_grid = param_grid
         self.config = config or BacktestConfig()
         self.cost_model = cost_model
@@ -141,21 +137,21 @@ class SignalStressTest:
 
     def run(
         self,
-        data: pd.DataFrame,
-        l2: list[OrderBookSnapshot] | None = None,
+        universe: Universe,
         timeframe: str | None = None,
     ) -> StressResult:
         combos = self._build_combos()
         rows = []
         results = {}
+        sym = universe.symbols[0] if universe.symbols else "ASSET"
 
         for combo in combos:
             params = {**self.fixed_params, **combo}
-            sig = self.signal_cls(**params)
-            bt = Backtester(signal=sig, config=self.config, cost_model=self.cost_model)
+            strategy = self.strategy_cls(symbol=sym, **params)
+            bt = Backtester(strategy=strategy, config=self.config, cost_model=self.cost_model)
 
             try:
-                res = bt.run(data, l2, timeframe=timeframe)
+                res = bt.run(universe=universe, timeframe=timeframe)
                 summary = res.summary()
                 key = str(combo)
                 rows.append({**combo, **summary})
@@ -164,7 +160,7 @@ class SignalStressTest:
                 rows.append({**combo, "error": str(e)})
 
         return StressResult(
-            name="signal_sweep",
+            name="param_sweep",
             summary=pd.DataFrame(rows),
             results=results,
         )
@@ -179,18 +175,9 @@ class CostStressTest:
     """
     Sweep transaction cost parameters to find where alpha breaks down.
 
-    Accepts either the old single-asset API or the new multi-asset API:
-
-      Old API (positional, backwards compatible):
-          cst = CostStressTest(cost_grid={...})
-          result = cst.run(signal, data)
-          result = cst.run(signal, data, l2)
-
-      New API (keyword):
-          result = cst.run(strategy=my_strategy, universe=my_universe)
-
-      Hybrid (signal over universe):
-          result = cst.run(signal=my_signal, universe=my_universe)
+    Usage:
+        cst = CostStressTest(cost_grid={...})
+        result = cst.run(strategy=my_strategy, universe=my_universe)
     """
 
     def __init__(
@@ -227,51 +214,23 @@ class CostStressTest:
 
     def run(
         self,
-        signal: Signal | None = None,
-        data: pd.DataFrame | None = None,
-        l2: list[OrderBookSnapshot] | None = None,
-        *,
-        strategy: Strategy | None = None,
-        universe: Universe | None = None,
+        strategy: Strategy,
+        universe: Universe,
     ) -> StressResult:
-        """
-        Run cost sweep.
-
-        Backwards-compatible positional call:
-            result = cst.run(signal, data)
-            result = cst.run(signal, data, l2)
-
-        New keyword API:
-            result = cst.run(strategy=strat, universe=univ)
-
-        Hybrid:
-            result = cst.run(signal=sig, universe=univ)
-        """
-        if signal is None and strategy is None:
-            raise ValueError("Provide either signal= or strategy=")
-
         combos = self._build_cost_combos()
         rows = []
         results = {}
 
         for combo in combos:
             cost_model = self.base_cost_model.with_overrides(**combo)
-
-            if strategy is not None:
-                bt = Backtester(
-                    strategy=copy.deepcopy(strategy),
-                    config=self.config,
-                    cost_model=cost_model,
-                )
-            else:
-                bt = Backtester(
-                    signal=copy.deepcopy(signal),
-                    config=self.config,
-                    cost_model=cost_model,
-                )
+            bt = Backtester(
+                strategy=copy.deepcopy(strategy),
+                config=self.config,
+                cost_model=cost_model,
+            )
 
             try:
-                res = _run_backtester(bt, data=data, l2=l2, universe=universe)
+                res = bt.run(universe=universe)
                 summary = res.summary()
                 flat_combo = {}
                 for mn, ps in combo.items():
@@ -303,22 +262,9 @@ class RegimeStressTest:
     """
     Split data by market regime and run backtest on each subset.
 
-    Accepts either the old single-asset API or the new multi-asset API.
-
-    For multi-asset (strategy + universe) mode the regime_fn receives
-    a reference DataFrame.  By default the first asset's OHLCV is used;
-    override with ``regime_symbol`` to pick a different asset.
-
-      Old API (positional, backwards compatible):
-          rst = RegimeStressTest(regime_fn=my_classifier)
-          result = rst.run(signal, data)
-
-      New API (keyword):
-          rst = RegimeStressTest(regime_fn=my_classifier, regime_symbol="BTC")
-          result = rst.run(strategy=my_strategy, universe=my_universe)
-
-      Hybrid:
-          result = rst.run(signal=sig, universe=univ)
+    Usage:
+        rst = RegimeStressTest(regime_fn=my_classifier, regime_symbol="BTC")
+        result = rst.run(strategy=my_strategy, universe=my_universe)
     """
 
     def __init__(
@@ -415,37 +361,11 @@ class RegimeStressTest:
 
     def run(
         self,
-        signal: Signal | None = None,
-        data: pd.DataFrame | None = None,
-        l2: list[OrderBookSnapshot] | None = None,
-        *,
-        strategy: Strategy | None = None,
-        universe: Universe | None = None,
+        strategy: Strategy,
+        universe: Universe,
     ) -> StressResult:
-        """
-        Run regime stress test.
-
-        Backwards-compatible positional call:
-            result = rst.run(signal, data)
-            result = rst.run(signal, data, l2)
-
-        New keyword API:
-            result = rst.run(strategy=strat, universe=univ)
-
-        Hybrid:
-            result = rst.run(signal=sig, universe=univ)
-        """
-        if signal is None and strategy is None:
-            raise ValueError("Provide either signal= or strategy=")
-
-        is_multi_asset = universe is not None
-
-        # ── Determine the reference DataFrame for regime classification ──
-        if is_multi_asset:
-            ref_sym = self.regime_symbol or universe.symbols[0]
-            ref_data = universe.ohlcv(ref_sym)
-        else:
-            ref_data = data
+        ref_sym = self.regime_symbol or universe.symbols[0]
+        ref_data = universe.ohlcv(ref_sym)
 
         regimes = self.regime_fn(ref_data)
         unique_regimes = regimes.dropna().unique()
@@ -454,69 +374,35 @@ class RegimeStressTest:
 
         for regime in unique_regimes:
             mask = regimes == regime
+            subset_idx = ref_data.index[mask]
+            if len(subset_idx) < 50:
+                continue
 
-            if is_multi_asset:
-                subset_idx = ref_data.index[mask]
-                if len(subset_idx) < 50:
-                    continue
+            sub_universe = self._build_subset_universe(universe, subset_idx)
+            if sub_universe.bar_count() < 50:
+                continue
 
-                sub_universe = self._build_subset_universe(universe, subset_idx)
-                if sub_universe.bar_count() < 50:
-                    continue
+            bt = Backtester(
+                strategy=copy.deepcopy(strategy),
+                config=self.config,
+                cost_model=self.cost_model,
+            )
 
-                if strategy is not None:
-                    bt = Backtester(
-                        strategy=copy.deepcopy(strategy),
-                        config=self.config,
-                        cost_model=self.cost_model,
-                    )
-                else:
-                    bt = Backtester(
-                        signal=copy.deepcopy(signal),
-                        config=self.config,
-                        cost_model=self.cost_model,
-                    )
-
-                try:
-                    res = bt.run(universe=sub_universe)
-                    summary = res.summary()
-                    rows.append({
-                        "regime": regime,
-                        "n_bars": sub_universe.bar_count(),
-                        **summary,
-                    })
-                    results[str(regime)] = res
-                except Exception as e:
-                    rows.append({
-                        "regime": regime,
-                        "n_bars": sub_universe.bar_count(),
-                        "error": str(e),
-                    })
-
-            else:
-                # ── Old single-asset path (unchanged) ────────────────────
-                subset = data[mask].copy()
-                if len(subset) < 50:
-                    continue
-
-                l2_sub = None
-                if l2 is not None:
-                    l2_sub = [l2[i] for i, m in enumerate(mask) if m and i < len(l2)]
-
-                sig = copy.deepcopy(signal)
-                bt = Backtester(
-                    signal=sig, config=self.config, cost_model=self.cost_model,
-                )
-
-                try:
-                    res = bt.run(subset, l2_sub)
-                    summary = res.summary()
-                    rows.append({"regime": regime, "n_bars": len(subset), **summary})
-                    results[str(regime)] = res
-                except Exception as e:
-                    rows.append({
-                        "regime": regime, "n_bars": len(subset), "error": str(e),
-                    })
+            try:
+                res = bt.run(universe=sub_universe)
+                summary = res.summary()
+                rows.append({
+                    "regime": regime,
+                    "n_bars": sub_universe.bar_count(),
+                    **summary,
+                })
+                results[str(regime)] = res
+            except Exception as e:
+                rows.append({
+                    "regime": regime,
+                    "n_bars": sub_universe.bar_count(),
+                    "error": str(e),
+                })
 
         return StressResult(
             name="regime_stress",

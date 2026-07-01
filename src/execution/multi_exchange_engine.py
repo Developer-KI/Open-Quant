@@ -63,7 +63,7 @@ class MultiExchangeEngine:
         One CrossExchangeStrategy sees all exchanges and generates a
         MultiExchangeTarget that explicitly routes each leg.
 
-    Mode B — Per-exchange strategies (independent signals):
+    Mode B — Per-exchange strategies (independent):
         Each exchange runs its own Strategy independently. A shared
         MultiExchangePortfolio provides cross-exchange awareness, and
         an optional PortfolioOverlay can enforce portfolio-level limits.
@@ -520,7 +520,7 @@ class MultiExchangeEngine:
                         sizer_cfg = _sizer_config_shim(self.config, self.state.equity)
                         sizing_ctx = SizingContext(
                             equity=self.state.equity, price=price,
-                            signal=alloc.to_signal_result(), config=sizer_cfg,
+                            allocation=alloc, config=sizer_cfg,
                             position=ast.position, data=df, bar_idx=idx,
                             trade_history=self.state.closed_trades,
                             l2=l2_snap, bar_data=bar_dict,
@@ -564,7 +564,7 @@ class MultiExchangeEngine:
                         size=fill.filled_size or size,
                         entry_price=fill.fill_price or price,
                         reason_entry=alloc.reason,
-                        signal_values=alloc.meta,
+                        bar_values=alloc.meta,
                         meta={"symbol": sym, "exchange": ex_name},
                     )
                     self.state.trades.append(trade)

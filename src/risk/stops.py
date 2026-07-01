@@ -458,10 +458,10 @@ class CompositeStopLoss(StopLoss):
         return copy.deepcopy(self)
 
 
-class SignalStop(StopLoss):
+class EmbeddedStop(StopLoss):
     """
-    Defer to the signal's stop_loss/take_profit fields.
-    Default when no StopLoss is passed to the engine — backward compatibility.
+    Use the stop_loss/take_profit levels embedded in an Allocation.
+    Default when no StopLoss is passed to the engine.
     """
 
     def __init__(self):
@@ -489,14 +489,14 @@ class SignalStop(StopLoss):
     def check_with_levels(self, ctx: StopContext) -> StopResult:
         if self._sl is not None:
             if self._side == Side.LONG and ctx.low <= self._sl:
-                return StopResult(True, self._sl, f"Signal SL hit @ {self._sl:.4f}")
+                return StopResult(True, self._sl, f"SL hit @ {self._sl:.4f}")
             if self._side == Side.SHORT and ctx.high >= self._sl:
-                return StopResult(True, self._sl, f"Signal SL hit @ {self._sl:.4f}")
+                return StopResult(True, self._sl, f"SL hit @ {self._sl:.4f}")
         if self._tp is not None:
             if self._side == Side.LONG and ctx.high >= self._tp:
-                return StopResult(True, self._tp, f"Signal TP hit @ {self._tp:.4f}")
+                return StopResult(True, self._tp, f"TP hit @ {self._tp:.4f}")
             if self._side == Side.SHORT and ctx.low <= self._tp:
-                return StopResult(True, self._tp, f"Signal TP hit @ {self._tp:.4f}")
+                return StopResult(True, self._tp, f"TP hit @ {self._tp:.4f}")
         return StopResult()
 
     def reset(self):
@@ -505,5 +505,31 @@ class SignalStop(StopLoss):
         self._side = Side.FLAT
 
 
+class NopStopLoss(StopLoss):
+    """
+    No-op stop-loss: never triggers.
+
+    Pass ``stop_loss=NopStopLoss()`` to :class:`~backtester.engine.Backtester`
+    to satisfy one of the two conditions required for the vectorised fast path.
+    Exits happen solely when the signal changes side.
+    """
+
+    @property
+    def params(self) -> dict[str, Any]:
+        return {}
+
+    def on_entry(self, position: Position, ctx: StopContext) -> None:
+        pass
+
+    def update(self, ctx: StopContext) -> None:
+        pass
+
+    def check(self, ctx: StopContext) -> StopResult:
+        return StopResult(triggered=False)
+
+    def reset(self) -> None:
+        pass
+
+
 def default_stop_loss() -> StopLoss:
-    return SignalStop()
+    return EmbeddedStop()
