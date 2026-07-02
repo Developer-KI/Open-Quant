@@ -16,6 +16,7 @@ from strategy.indicators import ema, rsi, atr
 from strategy.universe import Universe
 from risk.sizing import FixedNotionalSizer
 from risk.stops import NopStopLoss
+from backtester.costs import NullCostModel
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -216,12 +217,15 @@ def demo(
 
     strategy = AlpacaEMARSIStrategy(symbol=symbol, fast=50, slow=200)
     sizer = FixedNotionalSizer()
+    stoploss = NopStopLoss()
+    no_cost = NullCostModel()
 
     bt = Backtester(
         strategy=strategy,
         config=config,
         sizer=sizer,
-        stop_loss=NopStopLoss(),
+        stop_loss=stoploss,
+        cost_model=no_cost,
     )
 
     print("\nRunning backtest...")

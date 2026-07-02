@@ -69,7 +69,6 @@ class BacktestResult:
     trades: list[Trade]
     equity_curve: pd.Series
     positions: pd.Series                            # side per bar (single-asset compat)
-    bar_log: pd.DataFrame                           # per-bar side/weight/confidence
     config: BacktestConfig
     run_time_s: float = 0.0
     meta: dict[str, Any] = field(default_factory=dict)
@@ -229,7 +228,7 @@ class BacktestResult:
         return path
 
     def save(self, run_name: str, base_dir: str = "logs/test") -> str:
-        """Save log.json, trades.csv, equity_curve.png, and bar_log.csv to logs/test/<run_name>/."""
+        """Save log.json, trades.csv, and equity_curve.png to logs/test/<run_name>/."""
         import dataclasses
         from datetime import datetime, timezone
 
@@ -267,9 +266,6 @@ class BacktestResult:
 
         self.to_csv(os.path.join(run_dir, "trades.csv"))
         self.plot_equity(save_path=os.path.join(run_dir, "equity_curve.png"))
-
-        if self.bar_log is not None and not self.bar_log.empty:
-            self.bar_log.to_csv(os.path.join(run_dir, "bar_log.csv"), index=False)
 
         return run_dir
 
@@ -434,9 +430,6 @@ class Backtester:
 
         if is_single_asset:
             sym0 = symbols[0]
-            _sig_sides_arr = np.array(
-                [Side(int(v)).name for v in sides_all[sym0]], dtype=object
-            )
             _pos_sides_arr = sides_all[sym0].astype(np.int8)
 
         for sym in symbols:
@@ -569,17 +562,9 @@ class Backtester:
 
         if is_single_asset:
             pos_series = pd.Series(_pos_sides_arr, index=index, name="position")
-            sig_df = pd.DataFrame({
-                "timestamp":  index,
-                "side":       _sig_sides_arr,
-                "weight":     weights_all[sym0],
-                "confidence": np.zeros(n_bars),
-                "reason":     np.full(n_bars, "", dtype=object),
-            })
         else:
             all_trades.sort(key=lambda t: t.timestamp)
             pos_series = pd.Series(np.zeros(n_bars, dtype=np.int8), index=index, name="position")
-            sig_df = pd.DataFrame()
 
         sym0 = symbols[0]
         meta: dict[str, Any] = {
@@ -596,7 +581,6 @@ class Backtester:
             trades=all_trades,
             equity_curve=eq_series,
             positions=pos_series,
-            bar_log=sig_df,
             config=self.config,
             run_time_s=time.perf_counter() - t0,
             meta=meta,
@@ -701,17 +685,8 @@ class Backtester:
         all_trades: list[Trade] = []
         closed_trades: list[Trade] = []
 
-        # Single-asset bar log: pre-allocated arrays avoid n_bars dict creations
-        if is_single_asset:
-            _sig_sides = np.empty(n_bars, dtype=object)
-            _sig_weights = np.zeros(n_bars, dtype=np.float64)
-            _sig_confidences = np.zeros(n_bars, dtype=np.float64)
-            _sig_reasons = np.empty(n_bars, dtype=object)
-            alloc_log_rows: list[dict] = []
-            pos_log_rows: list[dict] = []
-        else:
-            alloc_log_rows = []
-            pos_log_rows = []
+        alloc_log_rows: list[dict] = []
+        pos_log_rows: list[dict] = []
 
         # ── Bar loop ──────────────────────────────────────────────────────
 
@@ -831,15 +806,7 @@ class Backtester:
             )
             target = strategy.generate(ctx)
 
-            # Record bar log into pre-allocated arrays (single-asset)
-            if is_single_asset:
-                sym0 = symbols[0]
-                alloc = target[sym0]
-                _sig_sides[i] = alloc.side.name
-                _sig_weights[i] = alloc.weight
-                _sig_confidences[i] = alloc.confidence
-                _sig_reasons[i] = alloc.reason
-            else:
+            if not is_single_asset:
                 row = {"timestamp": ts}
                 for sym in symbols:
                     alloc = target[sym]
@@ -1085,18 +1052,6 @@ class Backtester:
                     np.zeros(n_bars, dtype=int), index=index, name="position",
                 )
 
-        # Build bar log from pre-allocated arrays (avoids n_bars dict constructions)
-        if is_single_asset:
-            sig_df = pd.DataFrame({
-                "timestamp": index,
-                "side": _sig_sides,
-                "weight": _sig_weights,
-                "confidence": _sig_confidences,
-                "reason": _sig_reasons,
-            })
-        else:
-            sig_df = pd.DataFrame(alloc_log_rows) if alloc_log_rows else pd.DataFrame()
-
         sym0 = symbols[0]
         meta: dict[str, Any] = {
             "symbols": symbols,
@@ -1112,7 +1067,6 @@ class Backtester:
             trades=final_trades,
             equity_curve=eq_series,
             positions=pos_series,
-            bar_log=sig_df,
             config=self.config,
             run_time_s=elapsed,
             meta=meta,
