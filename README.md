@@ -1,400 +1,486 @@
 # Quantitative Trading Framework
 
-A modular, multi-asset, multi-exchange Python framework for developing, backtesting, and live-trading quantitative strategies on crypto perpetual futures and spot markets. Hyperliquid and Binance are supported out of the box; any exchange can be plugged in via the registry pattern.
+A modular, production-ready Python framework for developing, backtesting, stress-testing, and live-trading quantitative strategies across crypto perpetual futures, spot markets, and US equities.
 
-Designed with a clean C++/Python seam: execution-critical hot paths are isolated behind `typing.Protocol` interfaces so they can be replaced with `pybind11` C++ extensions without touching strategy code.
+---
+
+## About the Author
+
+I'm Kiril Ivanov — a quant developer building systematic trading infrastructure from the ground up. This framework started as a personal research environment and grew into a full-featured toolkit I use for everything from rapid signal prototyping to live paper trading and rigorous statistical validation.
+
+My focus is on **doing things right**: clean dependency graphs, protocol-driven interfaces, statistically sound backtest methodology (no look-ahead, proper train/test/validate splits, deflated Sharpe ratio), and code that is easy to extend without being over-engineered.
+
+**Links:** [GitHub](https://github.com/Kiril-Ivanov) · [ivanov.r.kiril@abv.bg](mailto:ivanov.r.kiril@abv.bg)
+
+---
+
+## What This Framework Can Do
+
+| Capability | Details |
+|---|---|
+| **Data collection** | WebSocket scrapers for Hyperliquid (trades, L2, funding, bridge), Binance (trades, depth, funding, liquidations), Alpaca (IEX bars); Parquet storage |
+| **Historical data** | Bulk L2 tick download from Hyperliquid S3 archive; Binance REST backfill; LSE data integration |
+| **Strategy framework** | `SingleAssetStrategy` ABC — implement one `bar()` method; composite/multi-asset strategies; full indicator library |
+| **Backtesting** | Vectorised 10–50x fast path; pluggable cost models (fee, slippage, funding, market impact); equity curve, trade log, signal log |
+| **Hypothesis testing** | Walk-forward analysis; Deflated Sharpe Ratio; Probability of Backtest Overfitting; permutation tests; bootstrap CIs; train/test/validate splits |
+| **Stress testing** | Parameter sweep heat-maps; Monte Carlo bootstrap; regime stress tests (vol, trend) |
+| **Risk layer** | Kelly, Vol-target, Fixed-fractional, Fixed-notional sizers; ATR, trailing, fixed-% stops; daily-loss kill switch |
+| **Live trading** | Single and multi-exchange engines; Hyperliquid, Binance, Alpaca; warmup bars, kill switch, trade log CSV |
+| **Dashboard** | Streamlit app — data explorer, backtester UI, live trading dashboard |
 
 ---
 
 ## Quick Start
 
 ```bash
-# Install dependencies (Python 3.10+)
-pip install pandas pyarrow numpy streamlit plotly websockets
+# Python 3.10+
+pip install pandas pyarrow numpy streamlit plotly websockets scipy python-dotenv
 
 # Launch the dashboard
-streamlit run app/main.py
+streamlit run app/Strategy_Explorer.py
 
-# Collect data (Hyperliquid ETH — all streams)
+# Collect Hyperliquid ETH data (trades + L2 + funding)
 python -m src.data.feeds.hyperliquid --coin ETH --mode all
 
-# Run the backtest demo
-python trading/strategy_backtest_demo.py
+# Run the full strategy demo (backtest + hypothesis tests)
+python trading/backtest_demo.py
+
+# Run Alpaca paper-trading demo
+python trading/alpaca_livetest_demo.py --symbol SPY
+```
+
+Create a `.env` file in the project root for credentials:
+
+```env
+# Alpaca paper trading
+ALP_PAPER_KEY=your_key
+ALP_PAPER_SECRET=your_secret
+
+# Alpaca live trading (if needed)
+ALP_LIVE_KEY=your_key
+ALP_LIVE_SECRET=your_secret
+
+# Optional: LSE historical data
+LSE_DATA=your_key
 ```
 
 ---
 
-## Data Directory Layout
+## Full User Guide
 
-The scrapers and app share a single root:
+### Step 1 — Install & Project Setup
+
+```
+Trading/
+├── src/            # All library code
+├── app/            # Streamlit dashboard
+├── trading/        # Runnable demo scripts
+├── data/           # Collected market data (auto-created by scrapers)
+├── backtest_runs/  # Saved backtest results (auto-created)
+└── .env            # Credentials (never commit this)
+```
+
+Add `src/` to your Python path (or use `app/_path_setup.py` as a reference). The demo scripts in `trading/` handle this automatically.
+
+### Step 2 — Collect Data
+
+Data is saved as Parquet chunks under `data/<stream>/<exchange>/<symbol>/`.
+
+**Hyperliquid** (crypto perpetuals and spot):
+
+```bash
+# All streams: trades, L2 order book, funding rate
+python -m src.data.feeds.hyperliquid --coin ETH --mode all
+
+# Trades only
+python -m src.data.feeds.hyperliquid --coin ETH --mode trades
+
+# L2 order book, 5 levels of depth
+python -m src.data.feeds.hyperliquid --coin ETH --mode l2 --depth 5
+
+# L2 and trades combined (no funding — for spot symbols)
+python -m src.data.feeds.hyperliquid --coin ETH --mode l2/trades
+
+# Monitor a wallet for fills and order updates
+python -m src.data.feeds.hyperliquid --wallet 0xYOUR_ADDRESS
+
+# Bulk historical L2 download from Hyperliquid S3 archive
+python -m src.data.historical.hyperliquid --coin ETH --start 2024-01-01
+```
+
+**Binance** (USD-M futures):
+
+```bash
+python -m src.data.feeds.binance --coin ETHUSDT --market futures --streams trades l2 funding
+```
+
+**Alpaca** (US equities/ETFs/crypto):
+
+```bash
+python -m src.data.feeds.alpaca --symbol SPY --timeframe 1Min
+```
+
+**Data directory layout:**
 
 ```
 data/
 ├── trades/
-│   ├── HYPERLIQUID_PERPETUALS/<symbol>/*.parquet   # raw tick trades
+│   ├── HYPERLIQUID_PERPETUALS/<symbol>/*.parquet
 │   ├── HYPERLIQUID_SPOT/<symbol>/*.parquet
 │   └── BINANCE_PERPETUALS/<symbol>/*.parquet
 ├── l2/
-│   └── HYPERLIQUID_PERPETUALS/<symbol>/*.parquet   # L2 order book snapshots
+│   └── HYPERLIQUID_PERPETUALS/<symbol>/*.parquet
 ├── funding/
-│   └── HYPERLIQUID_PERPETUALS/<symbol>/*.parquet   # funding rate snapshots
-└── sentiment/                                       # optional: CSV files
+│   └── HYPERLIQUID_PERPETUALS/<symbol>/*.parquet
+└── sentiment/
 ```
 
-Each subfolder is written by the scrapers (`src/data/feeds/`) and read by the app (`app/pages/`) and parsers (`src/core/parser.py`).
-
----
-
-## Package Layout
-
-```
-src/
-├── core/               # Stable contracts — models, protocols, events, parser
-│   ├── models.py       # ALL data types (Side, Position, Trade, FundingSnapshot, …)
-│   ├── protocols.py    # typing.Protocol interfaces for C++ interop
-│   ├── events.py       # Typed event structs (BarEvent, TradeEvent, L2Event)
-│   └── parser.py       # Parsers: OHLCV resampling, L2, funding rate alignment
-│
-├── risk/               # Risk layer — depends only on core/
-│   ├── sizing.py       # Position sizers (Kelly, VolTarget, Fixed, Composite, …)
-│   ├── stops.py        # Stop-loss modules (ATR, Trailing, RiskReward, …)
-│   └── limits.py       # Kill-switch + daily loss/trade limits
-│
-├── strategy/           # Pure-Python strategy framework — depends on core/ + risk/
-│   ├── base.py         # Signal, Strategy, CrossExchangeStrategy ABC + registries
-│   ├── built_in.py     # SingleSignalStrategy, ZPairsSpread, CrossAssetMomentum, …
-│   ├── indicators.py   # Stateless indicator functions (ema, rsi, atr, bollinger, …)
-│   ├── universe.py     # Universe + auxiliary data sources (DataSource, StaticDataSource)
-│   └── overlay.py      # Cross-exchange portfolio overlays
-│
-├── backtester/         # Vectorized backtest engine — depends on core/ + risk/ + strategy/
-│   ├── engine.py       # Backtester (single-asset and multi-asset APIs)
-│   ├── costs.py        # Pluggable cost models (fee, slippage, funding, impact, …)
-│   └── stress.py       # Signal / cost / regime / Monte Carlo stress tests
-│
-├── execution/          # Live trading — depends on core/ + risk/ + strategy/
-│   ├── live_engine.py          # LiveEngine (single exchange)
-│   ├── multi_exchange_engine.py # MultiExchangeEngine (cross-exchange)
-│   ├── live_state.py           # LiveState, _AssetLiveState data holders
-│   ├── factory.py              # Registry-based executor + feed factory
-│   ├── base_executor_feed.py   # BaseExecutor, BaseFeed, BaseBarBuilder ABCs
-│   ├── hyperliquid/            # Hyperliquid executor + WebSocket feed
-│   └── binance/                # Binance USD-M executor + WebSocket feed
-│
-├── data/               # Unified data layer — depends only on core/
-│   ├── feeds/
-│   │   ├── hyperliquid.py       # HL perp/spot multi-stream (trades, L2, funding, wallet)
-│   │   ├── binance.py           # Binance trades/depth/funding + batch backfill
-│   │   ├── hyperliquid_bridge.py # Live Arbitrum bridge flows
-│   │   └── binance_liquidations.py # Global liquidation stream
-│   ├── historical/
-│   │   └── hyperliquid_l2.py    # Bulk L2 tick download from Hyperliquid S3 archive
-│   ├── sentiment/               # X.com, Reddit, Telegram, 4chan scrapers
-│   └── auxiliary/               # Macro REST poller, microstructure scanner
-│
-└── utils/
-    ├── plotting.py              # Equity curve + trade visualisation
-    ├── sentiment_score.py       # VADER / transformer sentiment scoring
-    └── http.py                  # Lightweight HTTP client
-```
-
-### Dependency order
-
-```
-core/
-  ↑
-risk/        strategy/        data/
-  ↑               ↑
-      backtester/   execution/
-                        ↑
-                      utils/
-```
-
-No module imports upward or sideways outside this DAG.
-
----
-
-## Parsers (`core/parser.py`)
-
-### Timeframes
-
-All parsers accept a `timeframe` string. Supported values:
-
-| Label | Bar size | Seconds |
-|-------|----------|---------|
-| `"1s"` | 1 second | 1 |
-| `"2s"` | 2 seconds | 2 |
-| `"5s"` | 5 seconds | 5 |
-| `"10s"` | 10 seconds | 10 |
-| `"15s"` | 15 seconds | 15 |
-| `"30s"` | 30 seconds | 30 |
-| `"1m"` | 1 minute | 60 |
-| `"2m"` | 2 minutes | 120 |
-| `"3m"` | 3 minutes | 180 |
-| `"5m"` | 5 minutes | 300 |
-| `"10m"` | 10 minutes | 600 |
-| `"15m"` | 15 minutes | 900 |
-| `"30m"` | 30 minutes | 1,800 |
-| `"1h"` | 1 hour | 3,600 |
-| `"2h"` | 2 hours | 7,200 |
-| `"4h"` | 4 hours | 14,400 |
-| `"6h"` | 6 hours | 21,600 |
-| `"8h"` | 8 hours | 28,800 |
-| `"12h"` | 12 hours | 43,200 |
-| `"1d"` | 1 day | 86,400 |
+### Step 3 — Load & Parse Data
 
 ```python
-from core.parser import TIMEFRAMES, timeframe_to_seconds
+from core.parser import trades_to_ohlcv, l2_to_orderbook, funding_to_snapshots, align_funding_to_ohlcv
+
+# Resample raw tick trades into any bar size
+eth_1h = trades_to_ohlcv("data/trades/HYPERLIQUID_PERPETUALS/ETH", timeframe="1h")
+# → DataFrame(DatetimeIndex, columns=[open, high, low, close, volume])
+
+# Load L2 snapshots aligned 1:1 with OHLCV bars
+l2_snaps = l2_to_orderbook("data/l2/HYPERLIQUID_PERPETUALS/ETH", ohlcv_data=eth_1h)
+
+# Load funding rates aligned to OHLCV bars
+fund_snaps = align_funding_to_ohlcv(
+    funding_to_snapshots("data/funding/HYPERLIQUID_PERPETUALS/ETH"),
+    eth_1h,
+)
 ```
 
-### OHLCV
+Supported timeframes: `1s 2s 5s 10s 15s 30s 1m 2m 3m 5m 10m 15m 30m 1h 2h 4h 6h 8h 12h 1d`
+
+### Step 4 — Write a Strategy
+
+Subclass `SingleAssetStrategy` and implement two methods:
+
+- `setup_data(data, l2)` — called once before the backtest to precompute indicators into `data`
+- `bar(data, idx) → Allocation` — called on each bar to produce a trading signal
 
 ```python
-from core.parser import trades_to_ohlcv
+from core.models import Allocation, Side
+from strategy.built_in import SingleAssetStrategy
+from strategy.indicators import ema, rsi
 
-# Resample raw trade ticks into any bar size
-eth_1m  = trades_to_ohlcv("data/trades/HYPERLIQUID_PERPETUALS/ETH", timeframe="1m")
-eth_5m  = trades_to_ohlcv("data/trades/HYPERLIQUID_PERPETUALS/ETH", timeframe="5m")
-eth_1h  = trades_to_ohlcv("data/trades/HYPERLIQUID_PERPETUALS/ETH", timeframe="1h")
-eth_1d  = trades_to_ohlcv("data/trades/HYPERLIQUID_PERPETUALS/ETH", timeframe="1d")
-# → DataFrame(index=DatetimeIndex, columns=[open, high, low, close, volume])
+class EmaRsiStrategy(SingleAssetStrategy):
+    def __init__(self, symbol: str, fast: int = 50, slow: int = 200, **kw):
+        super().__init__(symbol=symbol, **kw)
+        self.fast = fast
+        self.slow = slow
+
+    @property
+    def params(self) -> dict:
+        return {"fast": self.fast, "slow": self.slow}
+
+    def setup_data(self, data, l2=None):
+        data["ema_fast"] = ema(data["close"], self.fast)
+        data["ema_slow"] = ema(data["close"], self.slow)
+        data["rsi"]      = rsi(data["close"], 14)
+
+    def bar(self, data, idx: int) -> Allocation:
+        if idx < self.slow:
+            return Allocation()   # flat — not enough bars yet
+
+        ema_f = data["ema_fast"].iat[idx]
+        ema_s = data["ema_slow"].iat[idx]
+        rsi_v = data["rsi"].iat[idx]
+
+        if ema_f > ema_s and rsi_v < 80:
+            return Allocation(side=Side.LONG, weight=1.0, reason=f"EMA cross up | RSI={rsi_v:.0f}")
+
+        return Allocation()  # flat / hold
 ```
 
-### L2 Order Book
-
-```python
-from core.parser import l2_to_orderbook, parse_l2, align_l2_to_ohlcv
-
-# Load and parse L2 snapshots (aligned 1:1 with OHLCV bars by default)
-snapshots = l2_to_orderbook("data/l2/HYPERLIQUID_PERPETUALS/ETH", ohlcv_data=eth_1m)
-
-# Manual alignment with different methods
-raw_snaps = l2_to_orderbook("data/l2/...", aligned=False)
-aligned   = align_l2_to_ohlcv(raw_snaps, eth_1m, method="last")     # default
-aligned   = align_l2_to_ohlcv(raw_snaps, eth_1m, method="nearest")
-aligned   = align_l2_to_ohlcv(raw_snaps, eth_1m, method="vwap")     # merge within bar
-```
-
-### Funding Rate
-
-```python
-from core.parser import funding_to_snapshots, align_funding_to_ohlcv
-
-# Parse raw funding parquet → list[FundingSnapshot]
-fund_snaps = funding_to_snapshots("data/funding/HYPERLIQUID_PERPETUALS/ETH")
-
-# Align one snapshot per OHLCV bar (same interface as L2 alignment)
-aligned_funding = align_funding_to_ohlcv(fund_snaps, eth_1m, method="last")
-# → each entry has: .rate, .rate_annualized, .mark_price, .oracle_price
-```
-
-`FundingSnapshot` fields:
+**`Allocation` fields:**
 
 | Field | Type | Description |
 |---|---|---|
-| `timestamp` | `pd.Timestamp` | When this rate was published |
-| `rate` | `float` | Per-period rate (e.g. `0.0001` = 1 bps per 8h) |
-| `rate_annualized` | `float` | Annualised rate in bps |
-| `oracle_price` | `float` | Spot / index price from the exchange |
-| `mark_price` | `float` | Fair price used for funding and liquidation calcs |
+| `side` | `Side` | `LONG`, `SHORT`, or `FLAT` (default) |
+| `weight` | `float` | Position size fraction 0–1 (multiplied by sizer) |
+| `confidence` | `float` | Optional signal confidence 0–1 |
+| `reason` | `str` | Log message for debugging |
+| `stop_loss` | `float \| None` | Absolute stop price (used by `FixedFractionalSizer`) |
+| `take_profit` | `float \| None` | Absolute take-profit price |
 
----
+**Available indicators** (`from strategy.indicators import ...`):
 
-## Data Models (`core/models.py`)
-
-All data types live in one file with no internal dependencies:
-
-| Type | Purpose |
+| Function | Signature |
 |---|---|
-| `Side` | `LONG` / `SHORT` / `FLAT` enum |
-| `OrderBookLevel` | Single price/size level |
-| `OrderBookSnapshot` | Full L2 snapshot with timestamp; `.mid`, `.spread`, `.vwap_fill_price()` |
-| `FundingSnapshot` | Funding rate + mark/oracle prices |
-| `Trade` | Completed trade record (entry, exit, pnl, fees, slippage) |
-| `Position` | Open position state |
-| `SignalResult` | Signal output (side, weight, confidence, reason, stop/tp prices) |
-| `FillResult` | Order fill record from executor |
-| `BacktestConfig` | Fee rates, slippage, funding, leverage for backtests |
-| `LiveConfig` | Full config for live trading (credentials, symbols, risk limits) |
-| `ExchangeCredentials` | API keys + testnet flag per exchange |
+| `ema` | `(series, span)` |
+| `sma` | `(series, window)` |
+| `rsi` | `(series, period=14)` |
+| `atr` | `(high, low, close, period=14)` |
+| `bollinger` | `(series, window=20, num_std=2.0) → (mid, upper, lower)` |
+| `vwap_rolling` | `(price, volume, window)` |
+| `order_flow_imbalance` | `(bid_vol, ask_vol, window=20)` |
 
----
+**Built-in strategies** (`from strategy.built_in import ...`):
 
-## Writing a Strategy
+| Class | Description |
+|---|---|
+| `SingleAssetStrategy` | Base class — implement `bar()` |
+| `CompositeStrategy` | Combines multiple strategies with weights and threshold |
+| `BuyAndHoldStrategy` | Always long at full weight |
 
-### Single-asset signal
-
-```python
-from strategy.base import Signal, SignalResult, register_signal
-from strategy.indicators import ema
-from core.models import Side
-
-@register_signal("ema_cross")
-class EMACross(Signal):
-    def __init__(self, fast=12, slow=26, **kw):
-        super().__init__(**kw)
-        self.fast, self.slow = fast, slow
-
-    @property
-    def params(self):
-        return {"fast": self.fast, "slow": self.slow}
-
-    def setup(self, data, l2=None):
-        data["ema_f"] = ema(data["close"], self.fast)
-        data["ema_s"] = ema(data["close"], self.slow)
-
-    def generate(self, data, idx):
-        if idx < self.slow:
-            return SignalResult()
-        if data["ema_f"].iat[idx] > data["ema_s"].iat[idx]:
-            return SignalResult(target_side=Side.LONG, target_weight=1.0, reason="cross_up")
-        if data["ema_f"].iat[idx] < data["ema_s"].iat[idx]:
-            return SignalResult(target_side=Side.SHORT, target_weight=1.0, reason="cross_dn")
-        return SignalResult()
-```
-
-### Multi-asset strategy
+### Step 5 — Backtest
 
 ```python
-from strategy.base import Strategy, StrategyContext, PortfolioTarget, register_strategy
-from core.models import Side
-
-@register_strategy("momentum")
-class MomentumStrategy(Strategy):
-    def setup(self, universe):
-        pass  # precompute indicators from universe.ohlcv("ETH"), etc.
-
-    def generate(self, ctx: StrategyContext) -> PortfolioTarget:
-        target = PortfolioTarget()
-        for symbol in ctx.universe.symbols:
-            closes = ctx.universe.close(symbol)
-            ret = closes.pct_change(20).iat[ctx.bar_idx]
-            side = Side.LONG if ret > 0 else Side.SHORT
-            target.set(symbol, side=side, weight=0.5)
-        return target
-```
-
----
-
-## Backtesting
-
-```python
-from backtester.engine import Backtester
-from backtester.costs import CompositeCostModel, aggressive_cost_stack
 from core.models import BacktestConfig
-from core.parser import trades_to_ohlcv, l2_to_orderbook, funding_to_snapshots, align_funding_to_ohlcv
-from strategy.universe import Universe
+from core.universe import Universe
+from backtester.engine import Backtester
+from backtester.costs import CompositeCostModel, default_cost_stack
+from strategy.sizing import FixedNotionalSizer
+from strategy.stops import NopStopLoss
 
-timeframe = "1h"
-eth_ohlcv = trades_to_ohlcv("data/trades/HYPERLIQUID_PERPETUALS/ETH", timeframe=timeframe)
-
-# Optional: load and attach L2 + funding snapshots
-l2_snaps   = l2_to_orderbook("data/l2/HYPERLIQUID_PERPETUALS/ETH", eth_ohlcv)
-fund_snaps = align_funding_to_ohlcv(
-    funding_to_snapshots("data/funding/HYPERLIQUID_PERPETUALS/ETH"),
-    eth_ohlcv,
-)
-
+# Build universe
 universe = Universe(symbols=["ETH"])
-universe.add_asset("ETH", eth_ohlcv, l2=l2_snaps, funding=fund_snaps)
+universe.add_asset("ETH", eth_1h, l2=l2_snaps, funding=fund_snaps)
 
-config = BacktestConfig(taker_fee_bps=5.0, slippage_bps=1.0)
-costs  = CompositeCostModel(models=aggressive_cost_stack())
+# Configure backtest
+config = BacktestConfig(
+    initial_capital=100_000.0,
+    taker_fee_bps=5.0,       # 0.05%
+    slippage_bps=1.0,
+    leverage=1.0,
+    max_position_pct=1.0,
+)
+cost_model = CompositeCostModel(default_cost_stack())
 
-bt = Backtester(signal=EMACross(fast=12, slow=26), config=config, cost_model=costs)
+# Run
+bt = Backtester(
+    strategy=EmaRsiStrategy(symbol="ETH", fast=50, slow=200),
+    config=config,
+    sizer=FixedNotionalSizer(notional=10_000),
+    stop_loss=NopStopLoss(),
+    cost_model=cost_model,
+)
+result = bt.run(universe=universe, timeframe="1h")
 
-# timeframe drives accurate annualisation of Sharpe, vol, etc.
-result = bt.run(universe=universe, timeframe=timeframe)
+# Results
 print(result.summary())
-result.save("ema_cross_1h")
+result.save("ema_rsi_eth_1h")   # saves log.json, trades.csv, equity_curve.png, signal_log.csv
 ```
 
-`BacktestResult` interface:
+**`BacktestResult` interface:**
 
 | Method / field | Description |
 |---|---|
-| `.summary()` | dict: Sharpe, Calmar, max DD, win rate, total fees, … |
+| `.summary()` | dict: Sharpe, Sortino, Calmar, max DD, win rate, total fees, annualised return/vol |
 | `.trades_df()` | DataFrame of all closed trades |
 | `.equity_curve` | `pd.Series` indexed by timestamp |
-| `.signal_log` | per-bar signal values |
-| `.plot_equity(path)` | saves equity + drawdown PNG |
-| `.save(run_name)` | saves `log.json`, `trades.csv`, `equity_curve.png`, `signal_log.csv` |
-| `.trades_by_symbol(sym)` | filter trades in multi-asset runs |
+| `.signal_log` | Per-bar signal values |
+| `.plot_equity(path)` | Saves equity + drawdown PNG |
+| `.save(run_name)` | Saves all outputs to `backtest_runs/<run_name>/` |
+| `.trades_by_symbol(sym)` | Filter trades in multi-asset runs |
+| `.meta["vectorized"]` | `True` if the fast NumPy path ran |
 
-### Vectorised Fast Path
+**Vectorised fast path** — activates automatically (10–50x faster) when:
+1. `stop_loss=NopStopLoss()` (stops need bar-by-bar high/low; without them the full array is available)
+2. `sizer=FixedNotionalSizer(notional=N)` (price-only, no equity dependency)
 
-When two conditions are met, the engine bypasses the Python bar loop entirely and runs a fully NumPy-vectorised backtest that is typically **10–50× faster** on long histories:
+### Step 6 — Hypothesis Testing & Validation
 
-| Condition | What enables it |
-|---|---|
-| Stop-loss = `NopStopLoss` | Stops require bar-by-bar high/low checks; without stops the whole array is available upfront |
-| Sizer is `vectorizable` | Position size must be computable from price alone (no equity dependency). `FixedNotionalSizer(notional=…)` qualifies; equity-fraction sizers do not |
+The `hypothesis` module provides rigorous statistical tools to validate that a strategy has a genuine edge — not just in-sample luck.
 
-**How it works internally:**
-
-1. **Batch signal generation** — `strategy.generate_all(universe)` is called once, returning two dicts of `int8`/`float64` arrays (sides and weights per symbol) without creating any `StrategyContext`/`PortfolioTarget` objects.
-
-2. **Trade boundary detection** (O(M), M = number of trades) — `np.diff` on the sides array finds entry and close bars in one pass. Force-closes at end-of-data are appended explicitly.
-
-3. **Vectorised sizing** — `sizer.compute_vectorized(entry_prices, weights, config)` computes all position sizes in a single numpy call.
-
-4. **Cost arrays** (O(M) Python loop) — entry and exit fees are computed per-trade (not per-bar), then scattered onto sparse arrays via `np.add.at`.
-
-5. **Equity curve via cumsum** — `np.cumsum(close_events - entry_fees)` gives the realised equity at every bar. Unrealised PnL is added via a *forward-fill trick*: `np.maximum.accumulate` on the "last entry bar seen so far" index propagates the entry price and size forward without a Python loop.
+**Recommended workflow: Train → Test → Validate**
 
 ```python
-from backtester.engine import Backtester
-from risk.stops import NopStopLoss
-from risk.sizing import FixedNotionalSizer
-
-# Both conditions satisfied → vectorised path activates automatically
-bt = Backtester(
-    signal=MySignal(),
-    stop_loss=NopStopLoss(),
-    sizer=FixedNotionalSizer(notional=10_000),
+from hypothesis import (
+    TrainTestValidateSplit,
+    HypothesisTests,
+    PermutationTest,
+    BootstrapCI,
+    WalkForwardAnalysis,
+    DeflatedSharpeRatio,
+    report as hypothesis_report,
 )
-result = bt.run(universe=universe, timeframe="1h")
-print(result.meta["vectorized"])  # True
+
+# Split data into 60% train / 20% test / 20% validate (with 10-bar embargo)
+ttv = TrainTestValidateSplit.by_fractions(
+    universe, train_frac=0.60, test_frac=0.20, embargo_bars=10
+)
+print(ttv)  # shows date ranges for each split
 ```
 
-The result is numerically identical to the sequential path. The equity curve at every bar reflects true realized equity (entry and exit fees deducted at the bars where they occur). To confirm which path ran, check `result.meta["vectorized"]`.
-
-**When the fast path does NOT activate:**
-- Any stop-loss other than `NopStopLoss` (ATR stops, trailing stops, etc.)
-- `FixedNotionalSizer(equity_pct=…)` (equity-dependent — not vectorizable)
-- Any sizer whose `.vectorizable` property returns `False`
-- Strategies that return `None` from `generate_all()` (falls back to per-bar loop)
-
-### Stress testing
+**Phase 1 — Train (strategy design):** Explore and develop strategies on training data only.
 
 ```python
-from backtester.stress import SignalStressTest, CostStressTest, MonteCarloStress
+train_result = Backtester(strategy=my_strategy, ...).run(universe=ttv.train, timeframe="1h")
 
-# Sweep signal parameters
-sweep = SignalStressTest(
-    signal_cls=EMACross,
-    param_grid={"fast": [5, 8, 12, 20], "slow": [21, 26, 50]},
+# Walk-forward analysis: checks consistency across sub-periods
+wfa = WalkForwardAnalysis(
+    strategy_cls=EmaRsiStrategy,
+    strategy_params={"fast": 50, "slow": 200},
+    fixed_params={"symbol": "ETH"},
+    config=config, cost_model=cost_model, sizer=sizer, stop_loss=stop_loss,
 )
-result = sweep.run(data=eth_ohlcv, timeframe=timeframe)
+wf = wfa.run(universe=ttv.train, timeframe="1h", n_splits=5, split_method="expanding")
+print(f"Consistency: {wf.consistency_score:.0%}  IS/OOS efficiency: {wf.efficiency_ratio:.2f}")
+```
+
+**Phase 2 — Test (parameter optimisation):** Tune parameters on the test set. Track the number of trials for DSR correction.
+
+```python
+from backtester.stress import ParamSweep
+
+sweep = ParamSweep(
+    strategy_cls=EmaRsiStrategy,
+    param_grid={"fast": [20, 50, 100], "slow": [100, 150, 200]},
+    config=config, cost_model=cost_model, sizer=sizer, stop_loss=stop_loss,
+).run(universe=ttv.test, timeframe="1h")
+
+best = sweep.best("sharpe_ratio")
+n_trials = 3 * 3  # for DSR input
+```
+
+**Phase 3 — Validate (blind final evaluation):** Run the tuned strategy once on the held-out validate set. This number is your true performance estimate.
+
+```python
+val_result = Backtester(strategy=best_strategy, ...).run(universe=ttv.validate, timeframe="1h")
+
+# Full statistical battery
+tests = HypothesisTests.run_all(val_result)
+print(hypothesis_report(tests))
+
+# Permutation test — is the Sharpe ratio better than random trade ordering?
+pt = PermutationTest(metric="sharpe_ratio", n_permutations=2_000).run(val_result)
+print(f"p={pt.p_value:.4f}  {'Significant' if pt.reject_null else 'Not significant'}")
+
+# Bootstrap 95% confidence intervals
+cis = BootstrapCI(n_bootstrap=2_000, ci=0.95).run(val_result)
+
+# Deflated Sharpe Ratio — corrects for the number of parameter combos you tried
+dsr = DeflatedSharpeRatio()
+d = dsr.compute(val_result, n_trials=n_trials)
+print(f"DSR: SR={d.observed_sharpe:.3f}  deflated={d.deflated_sharpe:.3f}  {'Genuine edge' if d.reject_null else 'Likely overfit'}")
+```
+
+**Hypothesis tools reference:**
+
+| Class | What it checks |
+|---|---|
+| `HypothesisTests.run_all(result)` | Sharpe > 0, mean return > 0, win rate > 50%, normality, autocorrelation, stationarity |
+| `HypothesisTests.compare(r1, r2)` | Is strategy 1 statistically better than strategy 2? |
+| `PermutationTest` | Non-parametric: is the metric better than random permutations of the trade sequence? |
+| `BootstrapCI` | Bootstrap confidence intervals for any metric |
+| `WalkForwardAnalysis` | Expanding or rolling window sub-period consistency |
+| `DeflatedSharpeRatio` | Sharpe corrected for multiple testing (Minkowski's formula) |
+| `MultipleComparisonCorrection` | Bonferroni / Holm correction for family-wise error rate |
+| `ProbabilityOfBacktestOverfitting` | Bailey et al. CPCV-based overfit probability |
+| `TrainTestValidateSplit` | Three-way holdout with configurable fractions and embargo |
+
+### Step 7 — Stress Testing
+
+```python
+from backtester.stress import MonteCarloStress, ParamSweep, RegimeStressTest
+
+# Monte Carlo bootstrap — distribution of outcomes from trade resampling
+mc = MonteCarloStress(n_simulations=1_000, method="bootstrap")
+mc_res = mc.run(backtest_result)
+m = mc_res.meta
+print(f"Median return: {m['median_return']:.2f}%  5th: {m['5th_pctl_return']:.2f}%  95th: {m['95th_pctl_return']:.2f}%")
+
+# Parameter sweep heatmap
+sweep = ParamSweep(
+    strategy_cls=EmaRsiStrategy,
+    param_grid={"fast": [20, 50, 100], "slow": [100, 150, 200, 250]},
+    config=config, cost_model=cost_model, sizer=sizer, stop_loss=stop_loss,
+)
+result = sweep.run(universe=universe, timeframe="1h")
 result.plot_heatmap("fast", "slow", z="sharpe_ratio")
 
-# Bootstrap trade sequence
-mc = MonteCarloStress(n_samples=1000)
-mc.run(backtest_result).plot_confidence_bands()
+# Regime stress test — how does the strategy perform in different vol / trend regimes?
+rst = RegimeStressTest(regime_fn=RegimeStressTest.trend_regime, config=config, cost_model=cost_model)
+regime_summary = rst.run(strategy=my_strategy, universe=universe)
+print(regime_summary.summary)
 ```
 
----
-
-## Live Trading
-
-### Single exchange
+### Step 8 — Position Sizing
 
 ```python
-from execution.live_engine import LiveEngine
-from core.models import LiveConfig
-from core.parser import timeframe_to_seconds
-from risk.sizing import VolatilityTargetSizer
-from risk.stops import ATRStop
+from strategy.sizing import FixedNotionalSizer, FixedFractionalSizer, VolatilityTargetSizer
+
+# Fixed dollar notional per trade
+sizer = FixedNotionalSizer(notional=10_000)
+
+# Fixed fraction of equity (e.g. 10% per trade)
+sizer = FixedNotionalSizer(equity_pct=0.10)
+
+# Risk a fixed fraction of equity per trade (uses stop distance if available)
+sizer = FixedFractionalSizer(risk_frac=0.02)   # risk 2% of equity per trade
+
+# Target a fixed annualised volatility (scales size to hit ~15% annual vol)
+sizer = VolatilityTargetSizer(target_vol=0.15)
+```
+
+### Step 9 — Stop-Loss Modules
+
+```python
+from strategy.stops import NopStopLoss, FixedPercentStop, ATRStop, TrailingStop
+
+# No stop (enables vectorised backtest fast path)
+stop = NopStopLoss()
+
+# Fixed percentage SL + optional TP from entry
+stop = FixedPercentStop(sl_pct=2.0, tp_pct=4.0)
+
+# ATR-based SL and TP
+stop = ATRStop(atr_mult_sl=2.0, atr_mult_tp=3.0, atr_period=14)
+
+# Trailing stop (moves with the market, locks in profit)
+stop = TrailingStop(trail_pct=1.5)
+```
+
+### Step 10 — Live Trading
+
+**Alpaca (US equities / ETFs / crypto, paper and live):**
+
+```python
+from core.models import LiveConfig, ExchangeCredentials
+from execution import Engine as LiveEngine
+from strategy.sizing import FixedNotionalSizer
+from strategy.stops import NopStopLoss
+
+cred = ExchangeCredentials(
+    exchange="alpaca",
+    api_key="ALP_PAPER_KEY",
+    api_secret="ALP_PAPER_SECRET",
+    testnet=True,   # paper trading
+)
+
+config = LiveConfig(
+    exchange="alpaca",
+    use_testnet=True,
+    exchanges=[cred],
+    symbol="SPY",
+    bar_interval_s=60,       # 1-minute bars
+    warmup_bars=300,          # bars before first trade
+    max_position_pct=0.10,
+    leverage=1.0,
+    max_daily_trades=20,
+    max_daily_loss_pct=3.0,
+    trade_log_csv="trades.csv",
+)
+
+engine = LiveEngine(
+    strategy=EmaRsiStrategy(symbol="SPY", fast=50, slow=200),
+    config=config,
+    sizer=FixedNotionalSizer(notional=10_000),
+    stop_loss=NopStopLoss(),
+)
+engine.start()   # press 'q' + Enter to flatten & stop
+```
+
+**Hyperliquid (crypto perpetuals, testnet and mainnet):**
+
+```python
+from execution import Engine as LiveEngine
 
 config = LiveConfig(
     exchange="hyperliquid",
@@ -402,14 +488,14 @@ config = LiveConfig(
     secret_key="0x...",
     use_testnet=True,
     symbol="ETH",
-    bar_interval_s=timeframe_to_seconds("5m"),   # 300 seconds
+    bar_interval_s=300,     # 5-minute bars
     warmup_bars=200,
     risk_per_trade=0.02,
     max_daily_loss_pct=3.0,
 )
 
 engine = LiveEngine(
-    signal=EMACross(fast=12, slow=26),
+    strategy=EmaRsiStrategy(symbol="ETH"),
     config=config,
     sizer=VolatilityTargetSizer(target_vol=0.15),
     stop_loss=ATRStop(atr_mult_sl=2.0, atr_mult_tp=3.0),
@@ -417,11 +503,10 @@ engine = LiveEngine(
 engine.start()
 ```
 
-### Cross-exchange (funding arb, delta-neutral)
+**Cross-exchange (funding arbitrage, delta-neutral):**
 
 ```python
 from execution.multi_exchange_engine import MultiExchangeEngine
-from strategy.base import CrossExchangeStrategy
 
 engine = MultiExchangeEngine(
     strategy=FundingArbStrategy(),
@@ -433,53 +518,90 @@ engine.start()
 
 ---
 
-## Data Collection
-
-### Hyperliquid (trades + L2 + funding)
-
-```bash
-# All streams for ETH perpetual
-python -m src.data.feeds.hyperliquid --coin ETH --mode all
-
-# Just trades and L2 (no funding; spot does not have funding)
-python -m src.data.feeds.hyperliquid --coin ETH --mode l2/trades
-
-# L2 depth 5 levels
-python -m src.data.feeds.hyperliquid --coin ETH --mode l2 --depth 5
-
-# Wallet fills + order updates
-python -m src.data.feeds.hyperliquid --wallet 0xYOUR_ADDRESS
-```
-
-### Binance
-
-```bash
-python -m src.data.feeds.binance --coin ETHUSDT --market futures --streams trades l2 funding
-```
-
-Data is saved as parquet chunks under `data/<stream>/<exchange>/<symbol>/`.
-
----
-
 ## Streamlit Dashboard
 
 ```bash
-streamlit run app/main.py
+streamlit run app/Strategy_Explorer.py
 ```
-
-Three pages:
 
 | Page | Contents |
 |---|---|
-| **Data Explorer** | OHLCV charts with configurable bar timeframe; L2 depth + spread; funding rate over time; sentiment scatter; macro indicators |
-| **Backtester** | Signal selector + auto-generated param fields; bar timeframe selector; BacktestConfig (fees, slippage, leverage); Sizer; StopLoss; parameter sweep heatmap |
-| **Live Trading** | Exchange credentials; bar timeframe dropdown; risk limits; signal/sizer/stop forms; live equity and position dashboard |
+| **Strategy Explorer** (main) | OHLCV charts with configurable timeframe; EMA, SMA, Bollinger, RSI, ATR, MACD overlays; volatility regime chart; returns distribution + descriptive stats; strategy signal overlay; raw data download |
+| **Backtester** | Signal/strategy selector with auto-generated parameter fields; bar timeframe selector; fee/slippage/leverage config; sizer and stop-loss config; hypothesis tests (DSR, permutation, bootstrap CIs); parameter sweep heatmap; regime stress test; Monte Carlo |
+
+Both pages load data from the LSE API — set `LSE_DATA=your_key` in `.env` or enter it in the sidebar.
+
+---
+
+## Package Layout
+
+```
+src/
+├── core/                   # Stable contracts — no upward imports
+│   ├── models.py           # All data types (Side, Allocation, Position, Trade, …)
+│   ├── protocols.py        # typing.Protocol interfaces for C++ interop
+│   ├── events.py           # Typed event structs (BarEvent, TradeEvent, L2Event)
+│   ├── universe.py         # Universe — holds OHLCV + L2 + funding per symbol
+│   └── parser.py           # OHLCV resampling, L2/funding alignment
+│
+├── strategy/               # Pure-Python strategy framework
+│   ├── base.py             # Strategy ABC + Signal ABC + registries
+│   ├── built_in.py         # SingleAssetStrategy, CompositeStrategy, …
+│   ├── indicators.py       # Stateless indicator functions
+│   ├── sizing.py           # Position sizers (FixedNotional, FixedFractional, VolTarget, …)
+│   └── stops.py            # Stop-loss modules (NopStop, FixedPct, ATR, Trailing, …)
+│
+├── backtester/             # Vectorised backtest engine
+│   ├── engine.py           # Backtester + BacktestResult
+│   ├── costs.py            # Pluggable cost models (fee, slippage, funding, impact)
+│   └── stress.py           # ParamSweep, MonteCarloStress, RegimeStressTest
+│
+├── hypothesis/             # Statistical validation
+│   ├── tests.py            # HypothesisTests, PermutationTest, BootstrapCI
+│   ├── walk_forward.py     # WalkForwardAnalysis
+│   ├── overfitting.py      # DeflatedSharpeRatio, ProbabilityOfBacktestOverfitting
+│   └── splits.py           # TrainTestValidateSplit, WalkForwardSplits
+│
+├── execution/              # Live trading engines
+│   ├── engine.py           # LiveEngine (single exchange)
+│   ├── multi_exchange_engine.py  # MultiExchangeEngine
+│   ├── factory.py          # Registry-based executor + feed factory
+│   ├── hyperliquid/        # Hyperliquid executor + WebSocket feed
+│   ├── binance/            # Binance USD-M executor + WebSocket feed
+│   └── alpaca/             # Alpaca executor + IEX bar feed
+│
+└── data/
+    ├── feeds/              # Live WebSocket scrapers (Hyperliquid, Binance, Alpaca)
+    ├── historical/         # Bulk historical downloaders (HL S3, Binance REST, Alpaca)
+    └── auxiliary/          # Sentiment (Reddit, Telegram, X, 4chan), macro, microstructure
+
+app/
+├── main.py                 # Streamlit entry point
+└── pages/
+    ├── 1_Visualizer.py     # Data explorer page
+    ├── 2_Backtest.py       # Backtester page
+    └── 3_Live.py           # Live trading page
+
+trading/
+├── backtest_demo.py        # Full TTV workflow with hypothesis tests
+└── alpaca_livetest_demo.py # Alpaca paper-trading live demo
+```
+
+**Dependency order** — no module imports outside this DAG:
+
+```
+core/
+  ↑
+strategy/   data/
+  ↑
+backtester/   hypothesis/   execution/
+```
 
 ---
 
 ## Adding an Exchange
 
-1. Create `src/execution/<exchange>/` with executor and feed modules inheriting from `BaseExecutor` and `BaseFeed`.
+1. Create `src/execution/<exchange>/` with an executor and feed module inheriting from `BaseExecutor` and `BaseFeed`.
 2. Register it:
 
 ```python
@@ -500,23 +622,39 @@ register_exchange(
 
 ## C++/Python Migration Path
 
-Execution-critical hot paths can be replaced with pybind11 C++ extensions one module at a time, without touching any strategy code:
+Execution-critical hot paths can be replaced with `pybind11` C++ extensions one module at a time. Any C++ class that satisfies the `Protocol` shapes in `src/core/protocols.py` is accepted without inheritance or registration.
 
 | Module | Current | Future C++ target |
 |---|---|---|
 | `core/protocols.py` `BarBuilderProtocol` | Python bar aggregator | Lock-free ring buffer |
 | `execution/base_executor_feed.py` `BaseBarBuilder` | Pure Python | C++ OHLCV aggregator |
 | `execution/live_state.py` | Python dataclass | C++ POD struct |
-| `execution/live_engine.py` `_process_bar` | Python per-bar loop | C++ event loop |
+| `execution/engine.py` `_process_bar` | Python per-bar loop | C++ event loop |
 
-C++ classes that satisfy the `Protocol` shapes in `core/protocols.py` are accepted anywhere in the stack without Python inheritance — no `register()` calls, no base class required.
+---
+
+## Data Models Reference
+
+All types live in `src/core/models.py`:
+
+| Type | Purpose |
+|---|---|
+| `Side` | `LONG / SHORT / FLAT` enum |
+| `Allocation` | Signal output (side, weight, confidence, reason, stop/tp prices) |
+| `Position` | Open position state |
+| `Trade` | Completed trade record (entry, exit, pnl, fees, slippage) |
+| `OrderBookSnapshot` | Full L2 snapshot — `.mid`, `.spread`, `.vwap_fill_price()` |
+| `FundingSnapshot` | Funding rate + mark/oracle prices |
+| `FillResult` | Order fill record from executor |
+| `BacktestConfig` | Fee rates, slippage, funding, leverage, capital |
+| `LiveConfig` | Full live trading config (credentials, symbols, risk limits) |
+| `ExchangeCredentials` | API keys + testnet flag per exchange |
 
 ---
 
 ## Demo Scripts
 
-| Script | What it shows |
+| Script | What it demonstrates |
 |---|---|
-| `trading/strategy_backtest_demo.py` | EMA cross signal, full backtest with cost model, parameter sweep |
-| `trading/strategy_live_demo.py` | Single-asset live run on Hyperliquid testnet |
-| `trading/p_strategy.py` | Cross-exchange funding-rate arbitrage (delta-neutral, multi-exchange) |
+| `trading/backtest_demo.py` | Full TTV workflow: EMA/RSI + Bollinger strategies, walk-forward, parameter sweep, DSR, permutation test, bootstrap CIs, Monte Carlo, regime stress |
+| `trading/alpaca_livetest_demo.py` | EMA/RSI strategy paper trading on Alpaca IEX, kill-switch, CSV trade log |

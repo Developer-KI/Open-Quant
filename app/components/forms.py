@@ -21,8 +21,8 @@ def _load_signal_modules():
     """Import known strategy modules once so their @register_strategy decorators fire."""
     for mod in [
         "strategy.built_in",
-        "trading.strategy_live_demo",
-        "trading.strategy_backtest_demo",
+        "trading.backtest_demo",
+        "trading.alpaca_livetest_demo",
     ]:
         try:
             __import__(mod)
