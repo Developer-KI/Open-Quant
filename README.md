@@ -1,32 +1,11 @@
 # Quantitative Trading Framework
-
-A modular, production-ready Python framework for developing, backtesting, stress-testing, and live-trading quantitative strategies.
-
 ---
 
-## About the Author
-
-I'm Kiril Ivanov — a quant developer building systematic trading infrastructure from the ground up. This framework started as a personal research environment and grew into a full-featured toolkit I use for everything from rapid signal prototyping to live paper trading and rigorous statistical validation.
+## About the Project
 
 My focus is on **doing things right**: clean dependency graphs, protocol-driven interfaces, statistically sound backtest methodology (no look-ahead, proper train/test/validate splits, deflated Sharpe ratio), and code that is easy to extend without being over-engineered.
 
 **Links:** [ivanov.r.kiril@abv.bg](mailto:ivanov.r.kiril@abv.bg)
-
----
-
-## What This Framework Can Do
-
-| Capability | Details |
-|---|---|
-| **Data collection** | WebSocket scrapers for Hyperliquid (trades, L2, funding, bridge), Binance (trades, depth, funding, liquidations), Alpaca (IEX bars); Parquet storage |
-| **Historical data** | Bulk L2 tick download from Hyperliquid S3 archive; Binance REST backfill; LSE data integration |
-| **Strategy framework** | `SingleAssetStrategy` ABC — implement one `bar()` method; composite/multi-asset strategies; full indicator library |
-| **Backtesting** | Vectorised 10–50x fast path; pluggable cost models (fee, slippage, funding, market impact); equity curve, trade log, signal log |
-| **Hypothesis testing** | Walk-forward analysis; Deflated Sharpe Ratio; Probability of Backtest Overfitting; permutation tests; bootstrap CIs; train/test/validate splits |
-| **Stress testing** | Parameter sweep heat-maps; Monte Carlo bootstrap; regime stress tests (vol, trend) |
-| **Risk layer** | Kelly, Vol-target, Fixed-fractional, Fixed-notional sizers; ATR, trailing, fixed-% stops; daily-loss kill switch |
-| **Live trading** | Single and multi-exchange engines; Hyperliquid, Binance, Alpaca; warmup bars, kill switch, trade log CSV |
-| **Dashboard** | Streamlit app — data explorer, backtester UI, live trading dashboard |
 
 ---
 
@@ -587,16 +566,6 @@ trading/
 └── alpaca_livetest_demo.py # Alpaca paper-trading live demo
 ```
 
-**Dependency order** — no module imports outside this DAG:
-
-```
-core/
-  ↑
-strategy/   data/
-  ↑
-backtester/   hypothesis/   execution/
-```
-
 ---
 
 ## Adding an Exchange
@@ -619,42 +588,3 @@ register_exchange(
 3. Pass `ExchangeCredentials(exchange="myexchange", ...)` to `LiveEngine` — the factory resolves the rest.
 
 ---
-
-## C++/Python Migration Path
-
-Execution-critical hot paths can be replaced with `pybind11` C++ extensions one module at a time. Any C++ class that satisfies the `Protocol` shapes in `src/core/protocols.py` is accepted without inheritance or registration.
-
-| Module | Current | Future C++ target |
-|---|---|---|
-| `core/protocols.py` `BarBuilderProtocol` | Python bar aggregator | Lock-free ring buffer |
-| `execution/base_executor_feed.py` `BaseBarBuilder` | Pure Python | C++ OHLCV aggregator |
-| `execution/live_state.py` | Python dataclass | C++ POD struct |
-| `execution/engine.py` `_process_bar` | Python per-bar loop | C++ event loop |
-
----
-
-## Data Models Reference
-
-All types live in `src/core/models.py`:
-
-| Type | Purpose |
-|---|---|
-| `Side` | `LONG / SHORT / FLAT` enum |
-| `Allocation` | Signal output (side, weight, confidence, reason, stop/tp prices) |
-| `Position` | Open position state |
-| `Trade` | Completed trade record (entry, exit, pnl, fees, slippage) |
-| `OrderBookSnapshot` | Full L2 snapshot — `.mid`, `.spread`, `.vwap_fill_price()` |
-| `FundingSnapshot` | Funding rate + mark/oracle prices |
-| `FillResult` | Order fill record from executor |
-| `BacktestConfig` | Fee rates, slippage, funding, leverage, capital |
-| `LiveConfig` | Full live trading config (credentials, symbols, risk limits) |
-| `ExchangeCredentials` | API keys + testnet flag per exchange |
-
----
-
-## Demo Scripts
-
-| Script | What it demonstrates |
-|---|---|
-| `trading/backtest_demo.py` | Full TTV workflow: EMA/RSI + Bollinger strategies, walk-forward, parameter sweep, DSR, permutation test, bootstrap CIs, Monte Carlo, regime stress |
-| `trading/alpaca_livetest_demo.py` | EMA/RSI strategy paper trading on Alpaca IEX, kill-switch, CSV trade log |
