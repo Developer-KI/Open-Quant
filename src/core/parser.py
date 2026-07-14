@@ -58,6 +58,15 @@ def timeframe_to_seconds(tf: str) -> int:
     return entry[1]
 
 
+def seconds_to_timeframe(seconds: int) -> str:
+    """Return the timeframe label for an exact bar duration in seconds."""
+    for tf, (_, secs) in _TIMEFRAME_MAP.items():
+        if secs == seconds:
+            return tf
+    raise ValueError(f"No timeframe label for {seconds}s. Valid durations: "
+                     f"{sorted(s for _, s in _TIMEFRAME_MAP.values())}")
+
+
 # ── OHLCV from raw trades ─────────────────────────────────────────────────────
 
 

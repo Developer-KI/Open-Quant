@@ -70,7 +70,7 @@ def report(tests: list[TestResult]) -> str:
 def _ann_factor(result: BacktestResult) -> float:
     """Infer per-bar annualization factor from the equity curve's time frequency."""
     eq = result.equity_curve
-    if len(eq) < 2 or not hasattr(eq.index, "to_series"):
+    if len(eq) < 2 or not isinstance(eq.index, pd.DatetimeIndex):
         return 252.0
     deltas = eq.index.to_series().diff().dropna()
     if deltas.empty:
@@ -453,12 +453,12 @@ class PermutationTest:
         self.n_permutations = n_permutations
         self.seed = seed
 
-    def _compute(self, pnl: np.ndarray, initial: float) -> float:
+    def _compute(self, pnl: np.ndarray, initial: float, ann_factor: float = 252.0) -> float:
         equity = initial + np.cumsum(pnl)
         returns = np.diff(equity) / equity[:-1]
         if self.metric == "sharpe_ratio":
             std = returns.std()
-            return float(returns.mean() / std * np.sqrt(252)) if std > 0 else 0.0
+            return float(returns.mean() / std * np.sqrt(ann_factor)) if std > 0 else 0.0
         elif self.metric == "total_return_pct":
             return float((equity[-1] / initial - 1) * 100)
         elif self.metric == "profit_factor":
@@ -475,10 +475,11 @@ class PermutationTest:
 
         pnl = tdf["pnl"].values
         initial = result.config.initial_capital
-        observed = self._compute(pnl, initial)
+        af = _ann_factor(result)
+        observed = self._compute(pnl, initial, af)
 
         null_dist = np.array([
-            self._compute(rng.permutation(pnl), initial)
+            self._compute(rng.permutation(pnl), initial, af)
             for _ in range(self.n_permutations)
         ])
         p_value = float(np.mean(null_dist >= observed))
@@ -545,15 +546,21 @@ class BootstrapCI:
         initial = result.config.initial_capital
         target = metrics or ["total_return_pct", "sharpe_ratio", "max_drawdown_pct", "win_rate_pct"]
 
+        af = _ann_factor(result)
+
         def _all_metrics(pnl_seq: np.ndarray) -> dict:
             equity = initial + np.cumsum(pnl_seq)
             ret = np.diff(equity) / equity[:-1]
-            std = ret.std()
-            sr = float(ret.mean() / std * np.sqrt(252)) if std > 0 else 0.0
+            std = float(ret.std()) if len(ret) > 1 else 0.0
+            total_ret = float(equity[-1] / initial - 1)
+            # Trade-based Sharpe: each trade is one period, annualize by trades/year (af).
+            # Note: this is a trade-frequency Sharpe, not a daily-return Sharpe — it is
+            # internally consistent across bootstrap samples but differs from summary().
+            sr = float(ret.mean() / std * np.sqrt(af)) if std > 0 else 0.0
             peak = np.maximum.accumulate(equity)
             max_dd = float(((equity - peak) / peak).min() * 100)
             return {
-                "total_return_pct": float((equity[-1] / initial - 1) * 100),
+                "total_return_pct": float(total_ret * 100),
                 "sharpe_ratio": sr,
                 "max_drawdown_pct": max_dd,
                 "win_rate_pct": float((pnl_seq > 0).mean() * 100),

@@ -280,12 +280,11 @@ class RegimeStressTest:
             if sub_ohlcv.empty:
                 continue
 
-            # Compute positional indices once for both L2 and funding
-            idx_positions = [
-                full_ohlcv.index.get_loc(ts)
-                for ts in common
-                if ts in full_ohlcv.index
-            ]
+            # Compute positional indices once for both L2 and funding.
+            # get_indexer (not get_loc) always returns an integer array, safe
+            # for non-unique indices where get_loc() would return slice/bool-array.
+            raw_locs = full_ohlcv.index.get_indexer(common)
+            idx_positions = [int(j) for j in raw_locs if j >= 0]
 
             full_l2 = universe.l2(sym)
             sub_l2 = None

@@ -364,8 +364,8 @@ class ProbabilityOfBacktestOverfitting:
             is_idx_list = [subperiods[i] for i in perm[:n_train]]
             oos_idx_list = [subperiods[i] for i in perm[n_train:]]
 
-            is_idx = is_idx_list[0].append(is_idx_list[1:]).sort_values()
-            oos_idx = oos_idx_list[0].append(oos_idx_list[1:]).sort_values()
+            is_idx = pd.concat(is_idx_list).sort_values()
+            oos_idx = pd.concat(oos_idx_list).sort_values()
 
             is_u = _slice_universe(universe, is_idx)
             oos_u = _slice_universe(universe, oos_idx)

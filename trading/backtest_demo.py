@@ -187,10 +187,15 @@ class BollingerMeanReversionStrategy(SingleAssetStrategy):
         super().__init__(symbol=symbol, **kw)
         self.window = window
         self.num_std = num_std
+        self._current_side: Side = Side.FLAT
 
     @property
     def params(self) -> dict:
         return {"window": self.window, "num_std": self.num_std}
+
+    def setup(self, universe):
+        self._current_side = Side.FLAT
+        super().setup(universe)
 
     def setup_data(self, data: pd.DataFrame, l2=None):
         data["bb_mid"], data["bb_upper"], data["bb_lower"] = bollinger(
@@ -209,7 +214,9 @@ class BollingerMeanReversionStrategy(SingleAssetStrategy):
         if any(v != v for v in (close, mid, upper, lower)):
             return Allocation()
 
+        # New entries take priority over holding/exit logic
         if close < lower:
+            self._current_side = Side.LONG
             return Allocation(
                 side=Side.LONG,
                 weight=1.0,
@@ -217,11 +224,30 @@ class BollingerMeanReversionStrategy(SingleAssetStrategy):
                 reason=f"BB oversold | close={close:.2f} < lower={lower:.2f}",
             )
         if close > upper:
+            self._current_side = Side.SHORT
             return Allocation(
                 side=Side.SHORT,
                 weight=1.0,
                 confidence=1.0,
                 reason=f"BB overbought | close={close:.2f} > upper={upper:.2f}",
+            )
+
+        # Exit at midline (hold until then)
+        if self._current_side == Side.LONG:
+            if close >= mid:
+                self._current_side = Side.FLAT
+                return Allocation(reason=f"BB long exit at midline | close={close:.2f} mid={mid:.2f}")
+            return Allocation(
+                side=Side.LONG, weight=1.0, confidence=1.0,
+                reason=f"BB holding long | close={close:.2f} mid={mid:.2f}",
+            )
+        if self._current_side == Side.SHORT:
+            if close <= mid:
+                self._current_side = Side.FLAT
+                return Allocation(reason=f"BB short exit at midline | close={close:.2f} mid={mid:.2f}")
+            return Allocation(
+                side=Side.SHORT, weight=1.0, confidence=1.0,
+                reason=f"BB holding short | close={close:.2f} mid={mid:.2f}",
             )
 
         return Allocation(reason=f"BB no signal | close={close:.2f} mid={mid:.2f}")
@@ -481,10 +507,10 @@ def _demo_multi_exchange(symbol: str, data: pd.DataFrame, timeframe: str) -> Non
 
 
 def demo(
-    symbol: str = "AAPL",
-    start: str = "2005-01-01",
-    end: str = "2026-01-01",
-    timeframe: str = "1m",
+    symbol: str = "NVDA",
+    start: str = "2010-01-01",
+    end: str = "2025-12-31",
+    timeframe: str = "1d",
 ):
     load_dotenv()
     _env = dotenv_values()
