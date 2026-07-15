@@ -65,21 +65,35 @@ def report(tests: list[TestResult]) -> str:
     return "\n".join(lines)
 
 
-# ── Annualization helper ──────────────────────────────────────────────────────
+# ── Scale-factor helper ───────────────────────────────────────────────────────
 
-def _ann_factor(result: BacktestResult) -> float:
-    """Infer per-bar annualization factor from the equity curve's time frequency."""
+def _scale_factor(result: BacktestResult) -> float:
+    """
+    Return the annualization / period scale factor used by result.summary().
+
+    For ≥1-year backtests this is 252 (daily) or bars-per-year (coarser).
+    For sub-year backtests this is the actual number of return observations,
+    so Sharpe / vol are period-scaled rather than extrapolated to a full year.
+
+    Reading from summary() ensures hypothesis tests stay in sync with the
+    metrics the user sees in the table — one source of truth.
+    """
+    s = result.summary()
+    sf = s.get("scale_factor")
+    if sf is not None:
+        return float(sf)
+    # Fallback for results produced before scale_factor was added to summary.
     eq = result.equity_curve
     if len(eq) < 2 or not isinstance(eq.index, pd.DatetimeIndex):
         return 252.0
-    deltas = eq.index.to_series().diff().dropna()
-    if deltas.empty:
-        return 252.0
-    median_secs = deltas.dt.total_seconds().median()
-    if median_secs <= 0:
-        return 252.0
-    secs_per_year = 365.25 * 24 * 3600
-    return secs_per_year / median_secs
+    med_secs = eq.index.to_series().diff().dropna().dt.total_seconds().median()
+    return float(365.25 * 24 * 3600 / med_secs) if med_secs > 0 else 252.0
+
+
+def _sharpe_label(result: BacktestResult) -> str:
+    """'Annualized' for ≥1-year runs, 'Period' for shorter."""
+    s = result.summary()
+    return "Annualized" if s.get("annualized", True) else "Period"
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -110,38 +124,44 @@ class HypothesisTests:
         """
         One-sided t-test (Jobson-Korkie): strategy Sharpe > benchmark_sharpe.
 
-        Uses the variance formula: Var(SR) ≈ (1 + SR²/2) / n, which accounts
-        for estimation error in both mean and variance of returns.
+        Uses trade-level pnl_pct returns so that flat (between-trade) bars don't
+        inflate n and produce spuriously small standard errors. Scale factor is
+        n_trades so SR is interpretable as trade-sequence signal-to-noise.
+        Var(SR) ≈ (1 + SR²/2) / n (Jobson-Korkie).
         """
-        returns = result.equity_curve.pct_change().dropna()
-        if len(returns) < 10:
-            raise ValueError("Need ≥ 10 return observations for Sharpe significance test")
-
+        tdf = result.trades_df()
+        if tdf.empty or "pnl_pct" not in tdf.columns:
+            raise ValueError("Need trade-level pnl_pct for Sharpe significance test")
+        returns = tdf["pnl_pct"].dropna().values
         n = len(returns)
-        ann = _ann_factor(result)
-        r_std = returns.std(ddof=1)
-        observed_sr = (returns.mean() / r_std * np.sqrt(ann)) if r_std > 0 else 0.0
+        if n < 30:
+            raise ValueError(f"Need ≥ 10 trades for Sharpe significance test (got {n})")
 
-        se = np.sqrt((1 + 0.5 * observed_sr ** 2) / n)
+        lbl = _sharpe_label(result)
+
+        r_std = float(returns.std(ddof=1))
+        observed_sr = float(returns.mean() / r_std * np.sqrt(n)) if r_std > 0 else 0.0
+
+        se     = np.sqrt((1 + 0.5 * observed_sr ** 2) / n)
         t_stat = (observed_sr - benchmark_sharpe) / se if se > 0 else 0.0
-        p_value = float(stats.t.sf(t_stat, df=n - 1))
+        p_val  = float(stats.t.sf(t_stat, df=n - 1))
 
         return TestResult(
             name="sharpe_significance",
             statistic=float(t_stat),
-            p_value=p_value,
+            p_value=p_val,
             alpha=alpha,
-            reject_null=p_value < alpha,
-            null_hypothesis=f"Annualized Sharpe ≤ {benchmark_sharpe}",
+            reject_null=p_val < alpha,
+            null_hypothesis=f"{lbl} trade Sharpe ≤ {benchmark_sharpe}",
             interpretation=(
-                f"Observed annualized Sharpe = {observed_sr:.3f}. "
+                f"Trade Sharpe = {observed_sr:.3f} ({n} trades). "
                 + (
-                    "Strategy Sharpe is significantly above benchmark."
-                    if p_value < alpha
+                    "Significantly positive."
+                    if p_val < alpha
                     else "Cannot confirm Sharpe significantly exceeds benchmark."
                 )
             ),
-            meta={"observed_sharpe": observed_sr, "n_bars": n, "ann_factor": ann},
+            meta={"observed_sharpe": observed_sr, "n_trades": n},
         )
 
     @staticmethod
@@ -177,18 +197,14 @@ class HypothesisTests:
         expected_rate: float = 0.5,
         alpha: float = 0.05,
     ) -> TestResult:
-        """
-        One-sided binomial test: win rate > expected_rate.
-
-        Use expected_rate=0.5 to test above-coin-flip performance.
-        """
+        """One-sided binomial test: win rate > expected_rate."""
         tdf = result.trades_df()
         if tdf.empty or "pnl" not in tdf.columns:
             raise ValueError("No trades available")
         wins = int((tdf["pnl"] > 0).sum())
         n = len(tdf)
         observed_wr = wins / n
-        binom = stats.binomtest(wins, n, expected_rate, alternative="greater")
+        binom  = stats.binomtest(wins, n, expected_rate, alternative="greater")
         p_value = float(binom.pvalue)
         return TestResult(
             name="win_rate",
@@ -262,10 +278,9 @@ class HypothesisTests:
         try:
             from statsmodels.stats.diagnostic import acorr_ljungbox
             lb = acorr_ljungbox(returns, lags=[lags], return_df=True)
-            lb_stat = float(lb["lb_stat"].iloc[0])
-            p_value = float(lb["lb_pvalue"].iloc[0])
+            lb_stat  = float(lb["lb_stat"].iloc[0])
+            p_value  = float(lb["lb_pvalue"].iloc[0])
         except ImportError:
-            # Manual Ljung-Box fallback
             n = len(returns)
             r = returns.values
             acf_vals = np.array([
@@ -294,10 +309,8 @@ class HypothesisTests:
         """
         Augmented Dickey-Fuller test on the equity curve.
 
-        Rejecting the unit-root null (random walk) is consistent with genuine alpha —
-        the equity curve has a deterministic drift, not just random variation.
-
-        Requires statsmodels: pip install statsmodels
+        Rejecting the unit-root null (random walk) is consistent with genuine alpha.
+        Requires statsmodels.
         """
         try:
             from statsmodels.tsa.stattools import adfuller
@@ -336,40 +349,39 @@ class HypothesisTests:
         """
         Bootstrap test: is result_a's metric significantly greater than result_b's?
 
-        Uses IID bootstrap on bar returns. For highly autocorrelated strategies,
-        consider using PermutationTest on trade PnL instead.
+        Sharpe is computed with each result's own scale_factor so the comparison
+        is consistent with what summary() reports for each strategy.
 
         Supported metrics: "sharpe_ratio", "total_return_pct", "sortino_ratio"
         """
-        rng = np.random.default_rng(seed)
-        ann_a = _ann_factor(result_a)
-        ann_b = _ann_factor(result_b)
+        rng   = np.random.default_rng(seed)
+        sf_a  = _scale_factor(result_a)
+        sf_b  = _scale_factor(result_b)
         ret_a = result_a.equity_curve.pct_change().dropna().values
         ret_b = result_b.equity_curve.pct_change().dropna().values
 
-        def _compute(returns: np.ndarray, ann: float) -> float:
+        def _compute(returns: np.ndarray, sf: float) -> float:
             if metric == "sharpe_ratio":
                 std = returns.std()
-                return float(returns.mean() / std * np.sqrt(ann)) if std > 0 else 0.0
+                return float(returns.mean() / std * np.sqrt(sf)) if std > 0 else 0.0
             elif metric == "total_return_pct":
                 return float(np.prod(1 + returns) - 1) * 100
             elif metric == "sortino_ratio":
-                neg = returns[returns < 0]
-                dstd = neg.std() if len(neg) > 0 else 1e-9
-                return float(returns.mean() / dstd * np.sqrt(ann)) if dstd > 0 else 0.0
+                neg  = returns[returns < 0]
+                dstd = float(neg.std()) if len(neg) > 1 else 1e-9
+                return float(returns.mean() / dstd * np.sqrt(sf)) if dstd > 0 else 0.0
             else:
                 raise ValueError(f"Unsupported metric for compare(): {metric!r}")
 
-        obs_a = _compute(ret_a, ann_a)
-        obs_b = _compute(ret_b, ann_b)
+        obs_a = _compute(ret_a, sf_a)
+        obs_b = _compute(ret_b, sf_b)
         observed_diff = obs_a - obs_b
 
         null_diffs = np.array([
-            _compute(rng.choice(ret_a, size=len(ret_a), replace=True), ann_a)
-            - _compute(rng.choice(ret_b, size=len(ret_b), replace=True), ann_b)
+            _compute(rng.choice(ret_a, size=len(ret_a), replace=True), sf_a)
+            - _compute(rng.choice(ret_b, size=len(ret_b), replace=True), sf_b)
             for _ in range(n_bootstrap)
         ])
-        # One-sided: P(A ≤ B) under the null
         p_value = float(np.mean(null_diffs <= 0))
 
         return TestResult(
@@ -407,7 +419,6 @@ class HypothesisTests:
             lambda r: HypothesisTests.mean_return(r, alpha=alpha),
             lambda r: HypothesisTests.win_rate(r, alpha=alpha),
             lambda r: HypothesisTests.normality(r, alpha=alpha),
-            lambda r: HypothesisTests.autocorrelation(r, alpha=alpha),
             lambda r: HypothesisTests.stationarity(r, alpha=alpha),
         ]
         results = []
@@ -433,6 +444,11 @@ class PermutationTest:
     This is more robust than parametric tests when the number of trades is small
     or return distributions are heavy-tailed.
 
+    For "sharpe_ratio", the scale factor is n_trades — every permutation has the
+    same trade count so the relative ranking (and therefore p-value) is unaffected
+    by the choice, and the absolute SR value is interpretable as signal-to-noise
+    across the observed number of trades.
+
     Usage:
         pt = PermutationTest(metric="sharpe_ratio", n_permutations=2000)
         result = pt.run(bt_result)
@@ -453,16 +469,28 @@ class PermutationTest:
         self.n_permutations = n_permutations
         self.seed = seed
 
-    def _compute(self, pnl: np.ndarray, initial: float, ann_factor: float = 252.0) -> float:
-        equity = initial + np.cumsum(pnl)
-        returns = np.diff(equity) / equity[:-1]
+    def _compute(self, pnl: np.ndarray, initial: float, n_trades: int) -> float:
+        """
+        Compute metric from a trade PnL sequence.
+
+        For sharpe_ratio we build the full equity path (including starting capital)
+        so that each return is divided by the *running* equity. This makes SR
+        order-dependent under permutation (different trade sequences produce different
+        compounding paths) and prevents degenerate std when pnl values are identical
+        (returns still differ because their denominators differ).
+        scale_factor = n_trades: consistent across all permutations.
+        """
         if self.metric == "sharpe_ratio":
-            std = returns.std()
-            return float(returns.mean() / std * np.sqrt(ann_factor)) if std > 0 else 0.0
+            eq = np.empty(n_trades + 1)
+            eq[0] = initial
+            eq[1:] = initial + np.cumsum(pnl)
+            ret = np.diff(eq) / eq[:-1]
+            std = ret.std(ddof=1)
+            return float(ret.mean() / std * np.sqrt(n_trades)) if std > 1e-12 else 0.0
         elif self.metric == "total_return_pct":
-            return float((equity[-1] / initial - 1) * 100)
+            return float(pnl.sum() / initial * 100)
         elif self.metric == "profit_factor":
-            gross_win = pnl[pnl > 0].sum()
+            gross_win  = pnl[pnl > 0].sum()
             gross_loss = abs(pnl[pnl < 0].sum())
             return float(gross_win / gross_loss) if gross_loss > 0 else float("inf")
         return 0.0
@@ -473,13 +501,18 @@ class PermutationTest:
         if tdf.empty or "pnl" not in tdf.columns:
             raise ValueError("No trades available")
 
-        pnl = tdf["pnl"].values
-        initial = result.config.initial_capital
-        af = _ann_factor(result)
-        observed = self._compute(pnl, initial, af)
+        pnl      = tdf["pnl"].values
+        initial  = result.config.initial_capital
+        n_trades = len(pnl)
+        if self.metric == "sharpe_ratio" and n_trades < 10:
+            raise ValueError(
+                f"Need ≥ 10 trades for permutation Sharpe test (got {n_trades}). "
+                "Use metric='total_return_pct' or 'profit_factor' for small trade counts."
+            )
+        observed = self._compute(pnl, initial, n_trades)
 
         null_dist = np.array([
-            self._compute(rng.permutation(pnl), initial, af)
+            self._compute(rng.permutation(pnl), initial, n_trades)
             for _ in range(self.n_permutations)
         ])
         p_value = float(np.mean(null_dist >= observed))
@@ -503,9 +536,10 @@ class PermutationTest:
             meta={
                 "observed": observed,
                 "null_mean": float(null_dist.mean()),
-                "null_p5": float(np.percentile(null_dist, 5)),
-                "null_p95": float(np.percentile(null_dist, 95)),
+                "null_p5":   float(np.percentile(null_dist, 5)),
+                "null_p95":  float(np.percentile(null_dist, 95)),
                 "n_permutations": self.n_permutations,
+                "n_trades": n_trades,
             },
         )
 
@@ -520,6 +554,10 @@ class BootstrapCI:
 
     Samples trade PnL with replacement to quantify estimation uncertainty —
     useful when the number of trades is small (< 100).
+
+    For "sharpe_ratio", the scale factor is n_trades (same reasoning as
+    PermutationTest): every bootstrap sample has the same trade count, so
+    the intervals are internally consistent and the absolute SR is interpretable.
 
     Usage:
         ci = BootstrapCI(ci=0.95)
@@ -542,32 +580,40 @@ class BootstrapCI:
         if tdf.empty or "pnl" not in tdf.columns:
             raise ValueError("No trades available")
 
-        pnl = tdf["pnl"].values
-        initial = result.config.initial_capital
-        target = metrics or ["total_return_pct", "sharpe_ratio", "max_drawdown_pct", "win_rate_pct"]
-
-        af = _ann_factor(result)
+        pnl      = tdf["pnl"].values
+        initial  = result.config.initial_capital
+        n_trades = len(pnl)
+        # SR requires enough unique trade outcomes for meaningful std estimation.
+        _MIN_TRADES_SR = 10
+        default_metrics = ["total_return_pct", "max_drawdown_pct", "win_rate_pct"]
+        if n_trades >= _MIN_TRADES_SR:
+            default_metrics.insert(1, "sharpe_ratio")
+        target = metrics or default_metrics
 
         def _all_metrics(pnl_seq: np.ndarray) -> dict:
-            equity = initial + np.cumsum(pnl_seq)
-            ret = np.diff(equity) / equity[:-1]
-            std = float(ret.std()) if len(ret) > 1 else 0.0
-            total_ret = float(equity[-1] / initial - 1)
-            # Trade-based Sharpe: each trade is one period, annualize by trades/year (af).
-            # Note: this is a trade-frequency Sharpe, not a daily-return Sharpe — it is
-            # internally consistent across bootstrap samples but differs from summary().
-            sr = float(ret.mean() / std * np.sqrt(af)) if std > 0 else 0.0
-            peak = np.maximum.accumulate(equity)
-            max_dd = float(((equity - peak) / peak).min() * 100)
+            # Equity-path returns: each return divided by running equity,
+            # so returns differ even when pnl values are identical — prevents
+            # degenerate std and the resulting SR explosion in bootstrap samples.
+            eq = np.empty(n_trades + 1)
+            eq[0] = initial
+            eq[1:] = initial + np.cumsum(pnl_seq)
+            ret = np.diff(eq) / eq[:-1]
+            std = float(ret.std(ddof=1)) if n_trades > 1 else 0.0
+            sr  = float(ret.mean() / std * np.sqrt(n_trades)) if std > 1e-12 else 0.0
+            peak   = np.maximum.accumulate(eq[1:])
+            max_dd = float(((eq[1:] - peak) / peak).min() * 100) if n_trades > 0 else 0.0
             return {
-                "total_return_pct": float(total_ret * 100),
-                "sharpe_ratio": sr,
+                "total_return_pct": float(pnl_seq.sum() / initial * 100),
+                "sharpe_ratio":     sr,
                 "max_drawdown_pct": max_dd,
-                "win_rate_pct": float((pnl_seq > 0).mean() * 100),
+                "win_rate_pct":     float((pnl_seq > 0).mean() * 100),
             }
 
         observed = _all_metrics(pnl)
-        samples = [_all_metrics(rng.choice(pnl, size=len(pnl), replace=True)) for _ in range(self.n_bootstrap)]
+        samples  = [
+            _all_metrics(rng.choice(pnl, size=n_trades, replace=True))
+            for _ in range(self.n_bootstrap)
+        ]
 
         lo = (1 - self.ci) / 2 * 100
         hi = (1 + self.ci) / 2 * 100
@@ -577,10 +623,10 @@ class BootstrapCI:
                 continue
             vals = np.array([s[m] for s in samples])
             output[m] = {
-                "observed": observed[m],
-                "lower": float(np.percentile(vals, lo)),
-                "upper": float(np.percentile(vals, hi)),
+                "observed":  observed[m],
+                "lower":     float(np.percentile(vals, lo)),
+                "upper":     float(np.percentile(vals, hi)),
                 "std_error": float(vals.std()),
-                "ci": self.ci,
+                "ci":        self.ci,
             }
         return output

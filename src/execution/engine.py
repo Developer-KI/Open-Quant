@@ -34,6 +34,7 @@ from core.models import (
     LiveConfig,
     ExchangeCredentials,
 )
+from core.parser import seconds_to_timeframe
 from strategy.sizing import Sizer, SizingContext, default_sizer
 from strategy.stops import StopLoss, StopContext, default_stop_loss
 from strategy.base import (
@@ -215,8 +216,9 @@ class Engine:
             for sym in self._symbols
         }
 
-        # 4. Warm-up historical bars
+        # 4. Warm-up historical bars, then do a one-time strategy setup
         self._warmup()
+        self._setup_strategies()
 
         # 5. Start thread pool and feeds
         n_workers = max(4, len(self._exchange_names))
@@ -350,6 +352,10 @@ class Engine:
                     df = ast.bar_builder.to_dataframe()
                     if len(df) >= 2:
                         self._universes[ex_name].update_asset_bars(sym, df)
+
+        # Refresh indicator columns — setup_data() wrote them onto the warmup DataFrame
+        # which update_asset_bars() just replaced with a new object.
+        self._refresh_indicators()
 
         trigger_df = self._assets[(trigger_exchange, trigger_symbol)].bar_builder.to_dataframe()
         if len(trigger_df) < 2:
@@ -486,13 +492,12 @@ class Engine:
         return self._generate_per_exchange(trigger_exchange, ts, all_positions)
 
     def _generate_cross(self, ts, all_positions) -> PortfolioTarget | None:
-        try:
-            self.cross_strategy.setup(self._universes)
-        except Exception as e:
-            logger.error("CrossStrategy setup failed: %s", e)
-            return None
         ctx = self._build_cross_ctx(ts, all_positions)
-        return self.cross_strategy.generate(ctx)
+        try:
+            return self.cross_strategy.generate(ctx)
+        except Exception as e:
+            logger.error("cross strategy generate() failed at %s: %s", ts, e, exc_info=True)
+            return None
 
     def _generate_per_exchange(
         self, trigger_exchange, ts, all_positions
@@ -501,11 +506,6 @@ class Engine:
         for ex_name, strat in self._per_exchange_strategies.items():
             universe = self._universes.get(ex_name)
             if universe is None:
-                continue
-            try:
-                strat.setup(universe)
-            except Exception as e:
-                logger.error("%s strategy setup failed: %s", ex_name, e)
                 continue
             bar_idx = 0
             for sym in self._symbols:
@@ -519,7 +519,12 @@ class Engine:
                 positions=all_positions.get(ex_name, {}),
                 trade_history=self.state.closed_trades,
             )
-            per_exchange_targets[ex_name] = strat.generate(ctx)
+            try:
+                per_exchange_targets[ex_name] = strat.generate(ctx)
+            except Exception as e:
+                logger.error(
+                    "%s strategy generate() failed at %s: %s", ex_name, ts, e, exc_info=True
+                )
         return PortfolioTarget.from_exchange_targets(per_exchange_targets)
 
     def _build_cross_ctx(self, ts, all_positions) -> StrategyContext:
@@ -713,7 +718,10 @@ class Engine:
             t.exit_timestamp = ts
             t.pnl = pnl
             t.pnl_pct = pnl / (pos.entry_price * pos.size) if pos.entry_price * pos.size > 0 else 0.0
-            t.fees = 0.0
+            # Preserve entry fees already recorded on the trade; do not zero them out.
+            # FillResult carries no fee field — exchange-reported fees would need to
+            # come from the executor's order status query and can be added here when
+            # the executor supports it.
             t.reason_exit = reason
             t.meta["symbol"] = symbol
             t.meta["exchange"] = exchange
@@ -752,14 +760,23 @@ class Engine:
     # ── Warm-up ───────────────────────────────────────────────────────────
 
     def _warmup(self):
+        try:
+            bar_tf = seconds_to_timeframe(self.config.bar_interval_s)
+        except ValueError:
+            bar_tf = "1m"
+            logger.warning(
+                "bar_interval_s=%d has no exact timeframe label; fetching warmup as 1m",
+                self.config.bar_interval_s,
+            )
         for cred in self._creds:
             executor = self._executors[cred.exchange]
             for sym in self._symbols:
-                logger.info("Fetching %d warmup bars for %s/%s...", self.config.warmup_bars, cred.exchange, sym)
+                logger.info("Fetching %d warmup bars for %s/%s (%s)...",
+                            self.config.warmup_bars, cred.exchange, sym, bar_tf)
                 try:
                     now_ms = int(time.time() * 1000)
                     start_ms = now_ms - self.config.warmup_bars * self.config.bar_interval_s * 1000
-                    rows = executor.fetch_historical_candles(sym, "1m", start_ms, now_ms)
+                    rows = executor.fetch_historical_candles(sym, bar_tf, start_ms, now_ms)
                     if rows:
                         df = pd.DataFrame(rows).set_index("timestamp")
                         key = (cred.exchange, sym)
@@ -771,6 +788,51 @@ class Engine:
                         logger.warning("  %s/%s: no warmup candles", cred.exchange, sym)
                 except Exception as e:
                     logger.warning("  %s/%s warmup failed: %s", cred.exchange, sym, e)
+
+    def _refresh_indicators(self):
+        """Re-apply setup_data() so indicator columns survive update_asset_bars() replacement."""
+        if self._mode == "cross":
+            strat = self.cross_strategy
+            if not hasattr(strat, "setup_data"):
+                return
+            for ex_name in self._exchange_names:
+                universe = self._universes.get(ex_name)
+                if universe is None:
+                    continue
+                for sym in self._symbols:
+                    try:
+                        strat.setup_data(universe.ohlcv(sym), universe.l2(sym))
+                    except Exception:
+                        pass
+        else:
+            for ex_name, strat in self._per_exchange_strategies.items():
+                if not hasattr(strat, "setup_data"):
+                    continue
+                universe = self._universes.get(ex_name)
+                if universe is None:
+                    continue
+                for sym in self._symbols:
+                    try:
+                        strat.setup_data(universe.ohlcv(sym), universe.l2(sym))
+                    except Exception:
+                        pass
+
+    def _setup_strategies(self):
+        """Call strategy.setup() once after warmup, not on every bar."""
+        if self._mode == "cross":
+            try:
+                self.cross_strategy.setup(self._universes)
+            except Exception as e:
+                logger.error("CrossStrategy initial setup failed: %s", e)
+        else:
+            for ex_name, strat in self._per_exchange_strategies.items():
+                universe = self._universes.get(ex_name)
+                if universe is None:
+                    continue
+                try:
+                    strat.setup(universe)
+                except Exception as e:
+                    logger.error("%s strategy initial setup failed: %s", ex_name, e)
 
     def _setup_logging(self):
         log_fmt = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"

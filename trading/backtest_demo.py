@@ -408,25 +408,31 @@ class MultiExchangeMomentumStrategy(Strategy):
 #  Demo runner
 # ═══════════════════════════════════════════════════════════════════════════
 
-_METRICS = [
-    ("Total return %",    "total_return_pct"),
-    ("Ann. return %",     "annualised_return_pct"),
-    ("Ann. volatility %", "annualised_volatility_pct"),
-    ("Sharpe",            "sharpe_ratio"),
-    ("Sortino",           "sortino_ratio"),
-    ("Max drawdown %",    "max_drawdown_pct"),
-    ("Num trades",        "num_trades"),
-    ("Win rate %",        "win_rate_pct"),
-]
-
-
 def _print_metrics_table(summaries: list[tuple[str, dict]]) -> None:
-    col = 24
+    # Derive horizon from the first summary that carries the flag.
+    is_annual = next((s.get("annualized", True) for _, s in summaries), True)
+    pfx  = "ann"   if is_annual else "period"
+    hlbl = "Ann."  if is_annual else "Period"
+
+    metrics = [
+        ("Total return %",             "total_return_pct"),
+        (f"{hlbl} return % (arith)",   f"{pfx}_return_pct"),
+        ("CAGR %",                     "cagr_pct"),
+        (f"{hlbl} volatility %",       f"{pfx}_volatility_pct"),
+        ("Sharpe (arith)",             "sharpe_ratio"),
+        ("Sharpe (geo)",               "geometric_sharpe"),
+        ("Sortino",                    "sortino_ratio"),
+        ("Max drawdown %",             "max_drawdown_pct"),
+        ("Num trades",                 "num_trades"),
+        ("Win rate %",                 "win_rate_pct"),
+    ]
+
+    col = 28
     headers = "".join(f"{label:>12}" for label, _ in summaries)
     print(f"\n{'Metric':<{col}} {headers}")
     print("-" * (col + 12 * len(summaries) + 1))
-    for label, key in _METRICS:
-        row = "".join(f"{s[key]:>12}" for _, s in summaries)
+    for label, key in metrics:
+        row = "".join(f"{s.get(key, 'n/a'):>12}" for _, s in summaries)
         print(f"{label:<{col}} {row}")
 
 
@@ -485,8 +491,7 @@ def _demo_multi_exchange(symbol: str, data: pd.DataFrame, timeframe: str) -> Non
 
     s = result.summary()
     print(f"\nCombined result  ({s['num_trades']} trades  |  run in {s['run_time_s']:.2f}s)")
-    for label, key in _METRICS:
-        print(f"  {label:<24} {s[key]:>10}")
+    _print_metrics_table([("Combined", s)])
 
     if result.equity_curves_by_exchange:
         print("\nPer-exchange breakdown:")

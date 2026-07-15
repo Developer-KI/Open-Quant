@@ -1,9 +1,0 @@
-fix backtest engine analytics since performance metrics are fucked.
-
-Quantum algos for pricing
-
-C++ project
-
-R project
-
-finish the open sentiment ML

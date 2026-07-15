@@ -48,6 +48,17 @@ from strategy.base import Strategy, StrategyContext, PortfolioTarget
 from core.universe import Universe
 
 
+def _max_consecutive(arr: np.ndarray, value: int) -> int:
+    """Maximum run length of `value` in a 0/1 integer array."""
+    if len(arr) == 0:
+        return 0
+    m = (arr == value).astype(np.int8)
+    tr = np.diff(m, prepend=0, append=0)
+    starts = np.where(tr == 1)[0]
+    ends   = np.where(tr == -1)[0]
+    return int((ends - starts).max()) if len(starts) > 0 else 0
+
+
 def _cost_model_label(m: CostModel) -> "str | list[str]":
     if isinstance(m, CompositeCostModel):
         return [type(c).__name__ for c in m.models]
@@ -98,98 +109,218 @@ class BacktestResult:
         df.to_csv(path, index=False)
         return path
 
-    # ── analytics (identical to old engine) ───────────────────────────────
+    # ── analytics ──────────────────────────────────────────────────────────
 
     def summary(self) -> dict[str, Any]:
-        eq = self.equity_curve
-        returns = eq.pct_change().dropna()
+        eq  = self.equity_curve
         tdf = self.trades_df()
 
-        total_return = (eq.iloc[-1] / eq.iloc[0]) - 1 if len(eq) > 1 else 0
-        n_bars = len(eq)
+        n_bars  = len(eq)
+        initial = float(eq.iloc[0])
+        final   = float(eq.iloc[-1])
+        total_return = (final / initial) - 1.0 if initial != 0.0 else 0.0
 
-        ann_factor = 365 * 24 if n_bars > 1 else 1
-        if "timeframe" in self.meta:
-            ann_factor = int(365 * 24 * 3600 / timeframe_to_seconds(self.meta["timeframe"]))
-        elif isinstance(eq.index, pd.DatetimeIndex) and len(eq.index) > 2:
-            secs = eq.index.to_series().diff().median().total_seconds()
-            if secs > 0:
-                ann_factor = int(365 * 24 * 3600 / secs)
-
-        ann_return = (1 + total_return) ** (ann_factor / max(n_bars, 1)) - 1
-        ann_vol = returns.std() * np.sqrt(ann_factor) if len(returns) > 1 else 0
-        sharpe = ann_return / ann_vol if ann_vol > 0 else 0
-
-        peak = eq.cummax()
-        dd = (eq - peak) / peak
-        max_dd = dd.min()
-
-        underwater = dd < 0
-        pct_time_underwater = float(underwater.mean() * 100)
-        uw_arr = underwater.values
-        if uw_arr.any():
-            transitions = np.diff(uw_arr.astype(np.int8), prepend=0, append=0)
-            lengths = np.where(transitions == -1)[0] - np.where(transitions == 1)[0]
-            max_time_underwater_bars = int(lengths.max())
-            avg_time_underwater_bars = float(lengths.mean())
-        else:
-            max_time_underwater_bars = 0
-            avg_time_underwater_bars = 0.0
-
-        if len(tdf) > 0 and "pnl" in tdf.columns:
-            wins = (tdf["pnl"] > 0).sum()
-            win_rate = wins / len(tdf)
-            avg_win = tdf.loc[tdf["pnl"] > 0, "pnl"].mean() if wins > 0 else 0
-            avg_loss = (
-                tdf.loc[tdf["pnl"] <= 0, "pnl"].mean()
-                if (len(tdf) - wins) > 0
-                else 0
+        # ── Calendar span ────────────────────────────────────────────────
+        if isinstance(eq.index, pd.DatetimeIndex) and n_bars > 1:
+            calendar_years = max(
+                (eq.index[-1] - eq.index[0]).total_seconds() / (365.25 * 24 * 3600),
+                1e-9,
             )
-            profit_factor = (
-                abs(avg_win * wins / (avg_loss * (len(tdf) - wins)))
-                if avg_loss != 0
-                else np.inf
+        elif "timeframe" in self.meta:
+            calendar_years = max(
+                n_bars * timeframe_to_seconds(self.meta["timeframe"]) / (365.25 * 24 * 3600),
+                1e-9,
             )
-            total_fees = tdf["fees"].sum()
         else:
-            win_rate = avg_win = avg_loss = profit_factor = total_fees = 0
+            calendar_years = 1.0
 
-        calmar = abs(ann_return / max_dd) if max_dd != 0 else 0
-        sortino_vol = (
-            returns[returns < 0].std() * np.sqrt(ann_factor)
-            if (returns < 0).any()
-            else 0
+        # ≥1 yr → annualize everything to a calendar year.
+        # <1 yr → scale to the actual backtest period so Sharpe/vol are not
+        #          extrapolated beyond the data we actually observed.
+        is_annual = calendar_years >= 1.0
+
+        cagr = (
+            (1.0 + total_return) ** (1.0 / calendar_years) - 1.0
+            if is_annual
+            else total_return   # sub-year: CAGR == total return, no extrapolation
         )
-        sortino = ann_return / sortino_vol if sortino_vol > 0 else 0
 
-        result = {
-            "total_return_pct": round(total_return * 100, 4),
-            "annualised_return_pct": round(ann_return * 100, 4),
-            "annualised_volatility_pct": round(ann_vol * 100, 4),
-            "sharpe_ratio": round(sharpe, 4),
-            "sortino_ratio": round(sortino, 4),
-            "calmar_ratio": round(calmar, 4),
-            "max_drawdown_pct": round(max_dd * 100, 4),
-            "pct_time_underwater": round(pct_time_underwater, 2),
-            "max_time_underwater_bars": max_time_underwater_bars,
-            "avg_time_underwater_bars": round(avg_time_underwater_bars, 1),
-            "num_trades": len(tdf),
-            "win_rate_pct": round(win_rate * 100, 2),
-            "avg_win": round(avg_win, 4),
-            "avg_loss": round(avg_loss, 4),
-            "profit_factor": round(profit_factor, 4),
-            "total_fees": round(total_fees, 4),
+        # ── Base returns + scaling factor ────────────────────────────────
+        # Intraday → resample to daily EOD to remove microstructure autocorrelation.
+        # Fall back to bar-level when < 5 trading-day samples.
+        #
+        # s_af controls what the metrics are scaled to:
+        #   is_annual  → 252 (or bars-per-year for coarser)  — annualized figures
+        #   sub-year   → n_rets (actual observation count)   — period figures
+        _MIN_DAILY = 5
+        bar_rets = eq.pct_change().dropna()
+
+        if isinstance(eq.index, pd.DatetimeIndex) and n_bars > 1 and not bar_rets.empty:
+            med_secs = eq.index.to_series().diff().dropna().dt.total_seconds().median()
+            if 0 < med_secs < 86400.0:
+                daily_eq   = eq.resample("D").last().dropna()
+                daily_rets = daily_eq.pct_change().dropna() if len(daily_eq) > 1 else pd.Series(dtype=float)
+                if len(daily_rets) >= _MIN_DAILY:
+                    base_rets = daily_rets
+                    s_af = 252.0 if is_annual else float(len(daily_rets))
+                else:
+                    base_rets = bar_rets
+                    s_af = float(n_bars / calendar_years) if is_annual else float(len(bar_rets))
+            else:
+                base_rets = bar_rets
+                s_af = float(n_bars / calendar_years) if is_annual else float(len(bar_rets))
+        else:
+            base_rets = bar_rets
+            s_af = float(n_bars / calendar_years) if is_annual else float(len(bar_rets))
+
+        n_r    = len(base_rets)
+        mean_r = float(base_rets.mean()) if n_r > 1 else 0.0
+        std_r  = float(base_rets.std())  if n_r > 1 else 0.0
+
+        # For ≥1yr: arithmetic annual return and annual vol.
+        # For <1yr: arithmetic period return (≈ total_return) and period vol.
+        scaled_return = mean_r * s_af
+        scaled_vol    = std_r * np.sqrt(s_af)
+        sharpe        = mean_r / std_r * np.sqrt(s_af) if std_r > 0.0 else 0.0
+
+        neg_rets  = base_rets[base_rets < 0.0]
+        down_std  = float(neg_rets.std()) if len(neg_rets) > 1 else 0.0
+        if down_std > 0.0:
+            sortino = mean_r / down_std * np.sqrt(s_af)
+        elif mean_r > 0.0:
+            sortino = sharpe   # no down periods — Sortino ≥ Sharpe by construction
+        else:
+            sortino = 0.0
+
+        # ── Drawdown ─────────────────────────────────────────────────────
+        peak      = eq.cummax()
+        dd_series = (eq - peak) / peak
+        max_dd    = float(dd_series.min())
+
+        in_dd_vals = dd_series[dd_series < 0.0]
+        avg_dd = float(in_dd_vals.mean()) if len(in_dd_vals) > 0 else 0.0
+
+        underwater   = dd_series < 0.0
+        pct_uw       = float(underwater.mean() * 100.0)
+        uw_arr       = underwater.values.astype(np.int8)
+        if uw_arr.any():
+            tr          = np.diff(uw_arr, prepend=0, append=0)
+            uw_lengths  = np.where(tr == -1)[0] - np.where(tr == 1)[0]
+            max_uw_bars = int(uw_lengths.max())
+            avg_uw_bars = float(uw_lengths.mean())
+        else:
+            max_uw_bars = 0
+            avg_uw_bars = 0.0
+
+        # calmar / recovery: None means "infinite" (positive return, zero drawdown)
+        calmar          = cagr / abs(max_dd)          if max_dd < 0.0 else (None if cagr > 0.0 else 0.0)
+        recovery_factor = total_return / abs(max_dd)  if max_dd < 0.0 else (None if total_return > 0.0 else 0.0)
+
+        # ── Trade stats ──────────────────────────────────────────────────
+        n_trades = len(tdf)
+        if n_trades > 0 and "pnl" in tdf.columns:
+            gross_wins   = tdf.loc[tdf["pnl"] > 0.0, "pnl"]
+            gross_losses = tdf.loc[tdf["pnl"] <= 0.0, "pnl"]
+            n_wins   = len(gross_wins)
+            n_losses = len(gross_losses)
+
+            win_rate         = n_wins / n_trades
+            avg_win          = float(gross_wins.mean())   if n_wins   > 0 else 0.0
+            avg_loss         = float(gross_losses.mean()) if n_losses > 0 else 0.0
+            total_gross_win  = float(gross_wins.sum())
+            total_gross_loss = float(gross_losses.sum())   # ≤ 0
+            profit_factor    = (
+                total_gross_win / abs(total_gross_loss)
+                if total_gross_loss < 0.0
+                else (None if total_gross_win > 0.0 else 0.0)
+            )
+            expectancy = float(tdf["pnl"].mean())
+            best_trade = float(tdf["pnl"].max())
+            worst_trade = float(tdf["pnl"].min())
+            total_fees = float(tdf["fees"].sum()) if "fees" in tdf.columns else 0.0
+
+            if "pnl_pct" in tdf.columns:
+                avg_win_pct   = float(tdf.loc[tdf["pnl"] > 0.0, "pnl_pct"].mean()  * 100.0) if n_wins   > 0 else 0.0
+                avg_loss_pct  = float(tdf.loc[tdf["pnl"] <= 0.0, "pnl_pct"].mean() * 100.0) if n_losses > 0 else 0.0
+                best_trade_pct  = float(tdf["pnl_pct"].max() * 100.0)
+                worst_trade_pct = float(tdf["pnl_pct"].min() * 100.0)
+            else:
+                avg_win_pct = avg_loss_pct = best_trade_pct = worst_trade_pct = 0.0
+
+            outcomes          = (tdf["pnl"] > 0.0).astype(int).values
+            max_consec_wins   = _max_consecutive(outcomes, 1)
+            max_consec_losses = _max_consecutive(outcomes, 0)
+        else:
+            n_wins = n_losses = 0
+            win_rate = avg_win = avg_loss = expectancy = 0.0
+            best_trade = worst_trade = total_fees = 0.0
+            avg_win_pct = avg_loss_pct = best_trade_pct = worst_trade_pct = 0.0
+            profit_factor = max_consec_wins = max_consec_losses = 0
+            total_gross_win = total_gross_loss = 0.0
+
+        # Time in market (fraction of bars with an open position)
+        pct_in_market = float((self.positions != 0).mean() * 100.0) if len(self.positions) > 0 else 0.0
+
+        # ── Formatting helper ────────────────────────────────────────────
+        def _r(v, d: int = 4):
+            """Round to d decimal places; pass through None; clamp float nan to 0."""
+            if v is None:
+                return None
+            v = float(v)
+            return 0.0 if np.isnan(v) else round(v, d)
+
+        geo_sharpe = cagr / scaled_vol if scaled_vol > 0.0 else 0.0
+
+        # Label prefix changes based on horizon so callers know what they're reading.
+        pfx = "ann" if is_annual else "period"
+
+        result: dict[str, Any] = {
+            # Returns
+            "total_return_pct":        _r(total_return * 100.0),
+            f"{pfx}_return_pct":       _r(scaled_return * 100.0),  # arith, scaled to horizon
+            "cagr_pct":                _r(cagr * 100.0),           # geo; ==total_return for <1yr
+            f"{pfx}_volatility_pct":   _r(scaled_vol * 100.0),
+            # Risk-adjusted
+            "sharpe_ratio":            _r(sharpe),       # scaled_return / scaled_vol (arith)
+            "geometric_sharpe":        _r(geo_sharpe),   # cagr / scaled_vol          (geo)
+            # Horizon metadata — used by hypothesis tests to stay consistent with summary()
+            "annualized":              is_annual,
+            "scale_factor":            float(s_af),
+            "sortino_ratio":      _r(sortino),
+            "calmar_ratio":       _r(calmar),
+            "recovery_factor":    _r(recovery_factor),
+            # Drawdown
+            "max_drawdown_pct":             _r(max_dd * 100.0),
+            "avg_drawdown_pct":             _r(avg_dd * 100.0),
+            "pct_time_underwater":          _r(pct_uw, 2),
+            "max_drawdown_duration_bars":   max_uw_bars,
+            "avg_drawdown_duration_bars":   _r(avg_uw_bars, 1),
+            # Trade stats
+            "num_trades":          n_trades,
+            "num_wins":            n_wins,
+            "num_losses":          n_losses,
+            "win_rate_pct":        _r(win_rate * 100.0, 2),
+            "profit_factor":       _r(profit_factor),
+            "expectancy":          _r(expectancy),
+            "avg_win":             _r(avg_win),
+            "avg_loss":            _r(avg_loss),
+            "avg_win_pct":         _r(avg_win_pct, 2),
+            "avg_loss_pct":        _r(avg_loss_pct, 2),
+            "best_trade_pct":      _r(best_trade_pct, 2),
+            "worst_trade_pct":     _r(worst_trade_pct, 2),
+            "max_consec_wins":     max_consec_wins,
+            "max_consec_losses":   max_consec_losses,
+            "pct_in_market":       _r(pct_in_market, 2),
+            "total_fees":          _r(total_fees),
+            # Run info
             "run_time_s": round(self.run_time_s, 3),
         }
 
-        # Extra field for multi-asset
         symbols = self.meta.get("symbols")
         if symbols and len(symbols) > 1:
-            result["symbols_traded"] = list(
-                tdf["meta_symbol"].unique()
-            ) if "meta_symbol" in tdf.columns else symbols
-
-        # Extra field for multi-exchange
+            result["symbols_traded"] = (
+                list(tdf["meta_symbol"].unique()) if "meta_symbol" in tdf.columns else symbols
+            )
         exchanges = self.meta.get("exchanges")
         if exchanges:
             result["exchanges"] = exchanges
@@ -515,19 +646,41 @@ class Backtester:
             directions    = sides[entry_bars].astype(np.float64)
             entry_weights = weights[entry_bars]
 
-            # ── Sizes ────────────────────────────────────────────────────
-            sizes = sizers[sym].compute_vectorized(
+            # ── Running equity per trade entry ───────────────────────────
+            # Compute a first-pass size estimate (using initial_capital) to get
+            # a proxy equity trajectory; then recompute sizes with running equity
+            # so equity-pct sizers shrink correctly as losses accumulate.
+            proxy_sizes = sizers[sym].compute_vectorized(
                 entry_prices, entry_weights, self.config
             )
+            proxy_sizes = np.maximum(proxy_sizes, 0.0)
+            proxy_gross = (exit_prices - entry_prices) * proxy_sizes * directions
+            running_eq = np.empty(len(entry_bars))
+            eq_cursor = float(initial_capital)
+            for k in range(len(entry_bars)):
+                running_eq[k] = max(eq_cursor, 1.0)
+                eq_cursor = max(eq_cursor + float(proxy_gross[k]), 1.0)
+
+            # ── Sizes (final pass with running equity) ───────────────────
+            try:
+                sizes = sizers[sym].compute_vectorized(
+                    entry_prices, entry_weights, self.config, running_eq
+                )
+            except TypeError:
+                # Backward-compatible fallback for sizers with old 3-param signature
+                sizes = sizers[sym].compute_vectorized(
+                    entry_prices, entry_weights, self.config
+                )
+            sizes = np.maximum(sizes, 0.0)
+
             if is_single_asset:
                 max_notional = (
-                    initial_capital
-                    * self.config.max_position_pct
-                    * self.config.leverage
-                    * np.ones(len(entry_bars))
+                    running_eq * self.config.max_position_pct * self.config.leverage
                 )
             else:
-                max_notional = initial_capital * entry_weights * self.config.leverage
+                max_notional = (
+                    running_eq * entry_weights * self.config.leverage
+                )
             sizes = np.minimum(sizes, np.where(entry_prices > 0, max_notional / entry_prices, 0.0))
             sizes = np.maximum(sizes, 0.0)
 
