@@ -532,8 +532,17 @@ class Backtester:
         symbols = universe.symbols
         is_single_asset = len(symbols) == 1
 
+        # A single-asset strategy run on a multi-asset universe should trade every
+        # asset independently — fan it out into one per-symbol copy rather than
+        # trading only its bound symbol and ignoring the rest of the universe.
+        strategy = self._strategy
+        if not is_single_asset:
+            from strategy.built_in import SingleAssetStrategy, PerAssetStrategy
+            if isinstance(strategy, SingleAssetStrategy):
+                strategy = PerAssetStrategy.from_template(strategy, symbols)
+
         return self._run_loop(
-            strategy=self._strategy,
+            strategy=strategy,
             universe=universe,
             symbols=symbols,
             is_single_asset=is_single_asset,

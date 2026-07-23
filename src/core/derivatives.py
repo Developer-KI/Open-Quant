@@ -6,12 +6,12 @@ reconstructs the implied volatility of every contract, computes the full Greek s
 builds an interpolable IV surface (smile + term structure + 3-D grid).
 
 Design mirrors indicators.py / sizing.py: small stateless functions plus a few dataclasses,
-importing only core.models + numpy. scipy is used when importable (Brent root-find and
-grid interpolation) with numpy fallbacks, so it is not a hard dependency.
+importing numpy + scipy. scipy is a hard dependency (declared in pyproject): it supplies the
+vectorized normal CDF, the Brent root-find, and the grid interpolation, all of which have no
+equal-quality pure-numpy substitute — so there are no fallbacks.
 
-Pricing models:
-  • Black-Scholes (European) — the fast, vectorized default.
-  • Binomial CRR tree (American) — opt-in via model="american" / american=True.
+Pricing model:
+  • Black-Scholes (European), continuous dividend yield q — vectorized.
 
 Greek conventions (raw, per unit — scale in the UI as needed):
   • delta : ∂V/∂S            (per $1 of underlying)
@@ -30,32 +30,12 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
-
-# ── Optional scipy acceleration (guarded; numpy fallbacks below) ──────────────
-try:
-    from scipy.special import ndtr as _ndtr  # vectorized standard-normal CDF
-    from scipy.optimize import brentq as _brentq
-    from scipy.optimize import least_squares as _least_squares
-    from scipy.interpolate import griddata as _griddata
-    _HAVE_SCIPY = True
-except Exception:  # pragma: no cover - exercised only when scipy is absent
-    _ndtr = None
-    _brentq = None
-    _least_squares = None
-    _griddata = None
-    _HAVE_SCIPY = False
+from scipy.special import ndtr as _ndtr  # vectorized standard-normal CDF
+from scipy.optimize import brentq as _brentq
+from scipy.optimize import least_squares as _least_squares
 
 _SQRT_2PI = math.sqrt(2.0 * math.pi)
 _YEAR_SECONDS = 365.25 * 24 * 3600  # calendar-year fraction denominator
-
-# Upper end of the volatility search. Short-dated deep ITM/OTM contracts routinely imply
-# 300-700% vol; a 500% cap (the old value) silently dropped ~11% of a live equity chain.
-MAX_IV = 20.0
-# Stale-quote tolerance: a last-traded price may sit a hair *below* intrinsic once spot has
-# moved since the trade. Violations within this slack are clamped to the bound instead of
-# being rejected as arbitrage. Expressed as a fraction of the intrinsic bound, floored at 1c.
-ARB_SLACK_REL = 0.01
-ARB_SLACK_ABS = 0.01
 
 
 def _to_utc(ts) -> pd.Timestamp:
@@ -67,19 +47,8 @@ def _to_utc(ts) -> pd.Timestamp:
 # ── Standard-normal helpers ───────────────────────────────────────────────────
 
 def _norm_cdf(x):
-    """Standard-normal CDF, vectorized. Uses scipy if available, else numpy erf approx."""
-    if _HAVE_SCIPY:
-        return _ndtr(x)
-    x = np.asarray(x, dtype=float)
-    # Abramowitz & Stegun 7.1.26 approximation of erf, applied to x/sqrt(2).
-    z = x / math.sqrt(2.0)
-    sign = np.sign(z)
-    az = np.abs(z)
-    t = 1.0 / (1.0 + 0.3275911 * az)
-    poly = t * (0.254829592 + t * (-0.284496736 + t * (1.421413741
-            + t * (-1.453152027 + t * 1.061405429))))
-    erf = 1.0 - poly * np.exp(-az * az)
-    return 0.5 * (1.0 + sign * erf)
+    """Standard-normal CDF, vectorized (scipy `ndtr`)."""
+    return _ndtr(x)
 
 
 def _norm_pdf(x):
@@ -335,50 +304,15 @@ def bs_vega(S, K, T, r, sigma, q=0.0):
     return float(vega) if np.ndim(vega) == 0 else vega
 
 
-# ── Binomial (CRR) pricing — American exercise ────────────────────────────────
-
-def binomial_price(S, K, T, r, sigma, option_type, q=0.0, steps=200, american=True):
-    """Cox-Ross-Rubinstein binomial price. Scalar inputs only.
-
-    american=True allows early exercise (equity-style); american=False is European
-    and converges to Black-Scholes as `steps` grows.
-    """
-    is_call = OptionType.parse(option_type) is OptionType.CALL
-    S = float(S); K = float(K); T = float(T); sigma = float(sigma)
-    if T <= 0 or sigma <= 0:
-        return max(S - K, 0.0) if is_call else max(K - S, 0.0)
-
-    dt = T / steps
-    u = math.exp(sigma * math.sqrt(dt))
-    d = 1.0 / u
-    disc = math.exp(-r * dt)
-    p = (math.exp((r - q) * dt) - d) / (u - d)
-    p = min(max(p, 0.0), 1.0)  # guard against degenerate params
-
-    j = np.arange(steps + 1)
-    prices = S * (u ** (steps - j)) * (d ** j)
-    if is_call:
-        values = np.maximum(prices - K, 0.0)
-    else:
-        values = np.maximum(K - prices, 0.0)
-
-    for step in range(steps, 0, -1):
-        prices = prices[: step] / u  # underlying prices one layer earlier
-        values = disc * (p * values[: step] + (1.0 - p) * values[1: step + 1])
-        if american:
-            intrinsic = (prices - K) if is_call else (K - prices)
-            values = np.maximum(values, intrinsic)
-    return float(values[0])
-
-
 # ── Implied volatility ────────────────────────────────────────────────────────
 
-def _sanitize_iv_inputs(price, S, K, T, r, q, is_call, american=False):
-    """Validate one contract's inputs and repair small no-arbitrage violations.
+def _sanitize_iv_inputs(price, S, K, T, r, q, is_call):
+    """Validate one contract's inputs against the Black-Scholes no-arbitrage bounds.
 
     Returns `(price, status)`. `status` is `"ok"` when `price` is usable, otherwise a short
     reason the contract cannot be inverted — surfaced as `iv_status` so blank IV/Greek cells
-    are explainable rather than mysterious.
+    are explainable rather than mysterious. Quotes outside the intrinsic/upper bounds are
+    rejected outright (no slack): they carry no well-defined implied vol.
     """
     if not np.isfinite(T) or T <= 0:
         return np.nan, "expired"
@@ -393,45 +327,37 @@ def _sanitize_iv_inputs(price, S, K, T, r, q, is_call, american=False):
     disc_q = math.exp(-q * T)
     lo_bound = max(S * disc_q - K * disc_r, 0.0) if is_call else max(K * disc_r - S * disc_q, 0.0)
     hi_bound = S * disc_q if is_call else K * disc_r
-    if american:
-        # Early exercise makes undiscounted intrinsic the binding floor, and an American
-        # option is never worth more than the spot (call) or the strike (put).
-        lo_bound = max(lo_bound, max(S - K, 0.0) if is_call else max(K - S, 0.0))
-        hi_bound = S if is_call else K
     if price < lo_bound:
-        slack = max(ARB_SLACK_REL * lo_bound, ARB_SLACK_ABS)
-        if price < lo_bound - slack:
-            return np.nan, "below intrinsic"
-        # Stale last-trade vs. live spot: nudge onto the bound so the solve still yields a
-        # (near-floor) vol instead of a hole in the table.
-        price = lo_bound * (1.0 + 1e-6) + 1e-8
+        return np.nan, "below intrinsic"
     if price > hi_bound:
         return np.nan, "above bound"
     return price, "ok"
 
 
-def _solve_bracketed(f, tol, lo=1e-6, hi_max=MAX_IV):
+def _solve_bracketed(f, tol, lo=1e-6):
     """Root-find `f` over vol, growing the upper bracket until it straddles the root.
 
-    A fixed upper bound is the wrong shape here: ATM contracts root near 0.2 while 1-DTE
-    deep ITM quotes can imply 7+. Doubling from 1.0 keeps the common case at one extra
-    evaluation while still reaching `hi_max`.
+    The Black-Scholes price is monotone increasing in σ and bounded above by the
+    no-arbitrage ceiling that `_sanitize_iv_inputs` already enforced, so a finite root is
+    guaranteed to exist and doubling the bracket from 1.0 will reach it. The doubling count
+    is bounded only as a runaway guard (2**64 vol is astronomically past any real quote),
+    not as a cap on admissible volatility.
     """
     flo = f(lo)
     if not np.isfinite(flo):
         return np.nan, "unsolvable"
     hi = 1.0
-    while hi <= hi_max:
+    for _ in range(64):
         fhi = f(hi)
-        if np.isfinite(fhi) and flo * fhi <= 0:
-            if _HAVE_SCIPY:
-                try:
-                    return float(_brentq(f, lo, hi, xtol=tol, maxiter=200)), "ok"
-                except Exception:
-                    return np.nan, "unsolvable"
-            return _bisect(f, lo, hi, tol), "ok"
+        if not np.isfinite(fhi):
+            return np.nan, "unsolvable"
+        if flo * fhi <= 0:
+            try:
+                return float(_brentq(f, lo, hi, xtol=tol, maxiter=200)), "ok"
+            except Exception:
+                return np.nan, "unsolvable"
         hi *= 2.0
-    return np.nan, "iv above cap"
+    return np.nan, "unsolvable"
 
 
 def _bs_iv_scalar(price, S, K, T, r, q, is_call, tol=1e-8, max_iter=100):
@@ -445,7 +371,7 @@ def _bs_iv_scalar(price, S, K, T, r, q, is_call, tol=1e-8, max_iter=100):
         return np.nan, status
 
     # Brenner-Subrahmanyam seed for at-the-money-ish contracts.
-    sigma = max(math.sqrt(2 * math.pi / T) * price / S, 1e-3)
+    sigma = math.sqrt(2 * math.pi / T) * price / S
     for _ in range(max_iter):
         model = black_scholes_price(S, K, T, r, sigma, otype, q)
         diff = model - price
@@ -455,59 +381,30 @@ def _bs_iv_scalar(price, S, K, T, r, q, is_call, tol=1e-8, max_iter=100):
         if v < 1e-10:
             break  # vega collapsed — hand off to the bracketed solver
         sigma -= diff / v
-        if sigma <= 0 or sigma > MAX_IV or not np.isfinite(sigma):
-            break
+        if sigma <= 0 or not np.isfinite(sigma):
+            break  # left the valid domain — hand off to the bracketed solver
 
     return _solve_bracketed(
         lambda sig: black_scholes_price(S, K, T, r, sig, otype, q) - price, tol)
 
 
-def _american_iv(price, S, K, T, r, q, is_call, steps=160, tol=1e-6):
-    """Invert the American binomial price for one contract. Returns `(iv, status)`."""
-    otype = OptionType.CALL if is_call else OptionType.PUT
-    price, status = _sanitize_iv_inputs(price, S, K, T, r, q, is_call, american=True)
-    if status != "ok":
-        return np.nan, status
-
-    return _solve_bracketed(
-        lambda sig: binomial_price(S, K, T, r, sig, otype, q, steps=steps, american=True) - price,
-        tol, lo=1e-4)
-
-
-def _bisect(f, lo, hi, tol=1e-8, max_iter=200):
-    flo = f(lo)
-    for _ in range(max_iter):
-        mid = 0.5 * (lo + hi)
-        fmid = f(mid)
-        if abs(fmid) < tol or (hi - lo) < tol:
-            return mid
-        if flo * fmid <= 0:
-            hi = mid
-        else:
-            lo, flo = mid, fmid
-    return 0.5 * (lo + hi)
-
-
-def implied_vol_detail(price, S, K, T, r, option_type, q=0.0, model="bs") -> tuple[float, str]:
+def implied_vol_detail(price, S, K, T, r, option_type, q=0.0) -> tuple[float, str]:
     """`(iv, status)` for one contract — `status` explains any NaN instead of raising."""
     is_call = OptionType.parse(option_type) is OptionType.CALL
-    if model == "american":
-        return _american_iv(price, S, K, T, r, q, is_call)
     return _bs_iv_scalar(price, S, K, T, r, q, is_call)
 
 
-def implied_vol(price, S, K, T, r, option_type, q=0.0, model="bs") -> float:
+def implied_vol(price, S, K, T, r, option_type, q=0.0) -> float:
     """Implied volatility for one contract. Returns np.nan for arbitrage-violating /
     unsolvable inputs rather than raising.
 
-    model: "bs" (European closed form) or "american" (binomial inversion).
     Use `implied_vol_detail` when you also want the reason for a NaN.
     """
-    return implied_vol_detail(price, S, K, T, r, option_type, q, model)[0]
+    return implied_vol_detail(price, S, K, T, r, option_type, q)[0]
 
 
 def implied_vol_chain(chain: OptionChain, r: float, q: float = 0.0,
-                      model: str = "bs", price: str = "mid") -> pd.DataFrame:
+                      price: str = "mid") -> pd.DataFrame:
     """Return the chain as a DataFrame with added `T` (years), `iv` and `iv_status` columns."""
     df = chain.to_df()
     if df.empty:
@@ -521,7 +418,7 @@ def implied_vol_chain(chain: OptionChain, r: float, q: float = 0.0,
     for c, t in zip(chain.contracts, T):
         px = c.price(price)
         S = c.underlying_price if np.isfinite(c.underlying_price) else chain.spot
-        iv, status = implied_vol_detail(px, S, c.strike, t, r, c.option_type, q, model)
+        iv, status = implied_vol_detail(px, S, c.strike, t, r, c.option_type, q)
         ivs.append(iv)
         statuses.append(status)
     df["iv"] = ivs
@@ -569,47 +466,23 @@ def _bs_greeks(S, K, T, r, sigma, is_call, q=0.0) -> OptionGreeks:
     return OptionGreeks(delta, gamma, vega, theta, rho)
 
 
-def _fd_greeks(S, K, T, r, sigma, is_call, q=0.0, steps=160) -> OptionGreeks:
-    """Finite-difference Greeks on the American binomial tree (bump and reprice)."""
-    otype = OptionType.CALL if is_call else OptionType.PUT
-
-    def px(s=S, k=K, t=T, rr=r, sig=sigma):
-        return binomial_price(s, k, t, rr, sig, otype, q, steps=steps, american=True)
-
-    base = px()
-    dS = S * 0.01
-    dSig = 0.01
-    dT = min(T * 0.01, 1.0 / 365.0)
-    dr = 1e-4
-    up, dn = px(s=S + dS), px(s=S - dS)
-    delta = (up - dn) / (2 * dS)
-    gamma = (up - 2 * base + dn) / (dS * dS)
-    vega = (px(sig=sigma + dSig) - px(sig=sigma - dSig)) / (2 * dSig)
-    theta = -(px(t=T + dT) - base) / dT if T > dT else np.nan  # per year, forward in time
-    rho = (px(rr=r + dr) - px(rr=r - dr)) / (2 * dr)
-    return OptionGreeks(delta, gamma, vega, theta, rho)
-
-
-def greeks(S, K, T, r, sigma, option_type, q=0.0, model="bs") -> OptionGreeks:
-    """Full Greek set for one contract. Analytic under Black-Scholes; finite-difference
-    on the binomial tree for model="american"."""
+def greeks(S, K, T, r, sigma, option_type, q=0.0) -> OptionGreeks:
+    """Full analytic Black-Scholes Greek set for one contract."""
     is_call = OptionType.parse(option_type) is OptionType.CALL
-    if model == "american":
-        return _fd_greeks(S, K, T, r, sigma, is_call, q)
     return _bs_greeks(S, K, T, r, sigma, is_call, q)
 
 
 def greeks_chain(chain: OptionChain, r: float, q: float = 0.0,
-                 model: str = "bs", price: str = "mid") -> pd.DataFrame:
+                 price: str = "mid") -> pd.DataFrame:
     """Chain DataFrame with `T`, `iv`, and delta/gamma/vega/theta/rho columns."""
-    df = implied_vol_chain(chain, r, q, model, price)
+    df = implied_vol_chain(chain, r, q, price)
     cols = {"delta": [], "gamma": [], "vega": [], "theta": [], "rho": []}
     for c, t, iv in zip(chain.contracts, df["T"], df["iv"]):
         S = c.underlying_price if np.isfinite(c.underlying_price) else chain.spot
         if not np.isfinite(iv):
             g = OptionGreeks(np.nan, np.nan, np.nan, np.nan, np.nan)
         else:
-            g = greeks(S, c.strike, t, r, iv, c.option_type, q, model)
+            g = greeks(S, c.strike, t, r, iv, c.option_type, q)
         for k, v in g.as_dict().items():
             cols[k].append(v)
     for k, v in cols.items():
@@ -617,146 +490,90 @@ def greeks_chain(chain: OptionChain, r: float, q: float = 0.0,
     return df
 
 
-# ── Heston stochastic-volatility model ────────────────────────────────────────
+# ── SVI parametric smile (Gatheral raw parameterization) ──────────────────────
+
+# Minimum distinct log-moneyness points to identify the 5-parameter SVI slice.
+_SVI_MIN_POINTS = 5
+
 
 @dataclass
-class HestonParams:
-    """Heston model parameters (variance dynamics under the risk-neutral measure)."""
+class SVIParams:
+    """Raw-SVI parameters (Gatheral) for one expiry slice, in total-variance space.
 
-    v0: float      # initial variance
-    kappa: float   # mean-reversion speed
-    theta: float   # long-run variance
-    sigma: float   # vol-of-vol
-    rho: float     # spot/variance correlation
-    rmse: float = float("nan")  # calibration fit error, in IV units (set by calibrate_heston)
+    Total implied variance as a function of forward log-moneyness k:
+
+        w(k) = a + b · ( ρ·(k − m) + √((k − m)² + σ²) )
+
+    and the Black-Scholes implied vol is √(w(k) / T). Parameters: `a` overall level, `b ≥ 0`
+    wing slope, `|ρ| < 1` skew/rotation, `m` horizontal shift of the minimum, `σ > 0`
+    curvature (ATM smoothness).
+    """
+
+    a: float
+    b: float
+    rho: float
+    m: float
+    sigma: float
+    T: float
+    rmse: float = float("nan")  # RMS fit error in IV (vol) units
+
+    def total_variance(self, k):
+        k = np.asarray(k, dtype=float)
+        return self.a + self.b * (self.rho * (k - self.m)
+                                  + np.sqrt((k - self.m) ** 2 + self.sigma ** 2))
+
+    def iv(self, k):
+        """Black-Scholes implied vol implied by the slice at log-moneyness k."""
+        if not (self.T > 0):
+            return np.full(np.shape(k), np.nan)
+        w = np.maximum(self.total_variance(k), 0.0)
+        return np.sqrt(w / self.T)
 
     def as_dict(self) -> dict[str, float]:
-        return {"v0": self.v0, "kappa": self.kappa, "theta": self.theta,
-                "sigma": self.sigma, "rho": self.rho}
-
-    @property
-    def feller(self) -> float:
-        """Feller ratio 2·κ·θ / σ² (>1 keeps the variance process strictly positive)."""
-        return (2.0 * self.kappa * self.theta / (self.sigma ** 2)
-                if self.sigma > 0 else float("inf"))
+        return {"a": self.a, "b": self.b, "rho": self.rho, "m": self.m, "sigma": self.sigma}
 
 
-# 64-node Gauss-Legendre quadrature on [-1, 1], reused for every Heston integral.
-_HESTON_NODES, _HESTON_WEIGHTS = np.polynomial.legendre.leggauss(64)
-_HESTON_UMAX = 120.0  # integration truncation for the characteristic-function integral
+def fit_svi(k, iv, T) -> "SVIParams | None":
+    """Least-squares fit of raw SVI to one expiry's (log-moneyness, IV) points.
 
-
-def _heston_integrand(phi, S, K, T, r, q, p: "HestonParams", j: int):
-    """Vectorized integrand for probability P_j — Albrecher 'little trap' formulation
-    (numerically stable branch of the Heston characteristic function)."""
-    i = 1j
-    if j == 1:
-        u = 0.5
-        b = p.kappa - p.rho * p.sigma
-    else:
-        u = -0.5
-        b = p.kappa
-    rho_sig_iphi = p.rho * p.sigma * i * phi
-    d = np.sqrt((rho_sig_iphi - b) ** 2 - p.sigma ** 2 * (2 * u * i * phi - phi ** 2))
-    g = (b - rho_sig_iphi - d) / (b - rho_sig_iphi + d)   # little-trap g2 = 1/g
-    edt = np.exp(-d * T)
-    C = ((r - q) * i * phi * T
-         + (p.kappa * p.theta / p.sigma ** 2)
-         * ((b - rho_sig_iphi - d) * T - 2.0 * np.log((1 - g * edt) / (1 - g))))
-    D = ((b - rho_sig_iphi - d) / p.sigma ** 2) * ((1 - edt) / (1 - g * edt))
-    f = np.exp(C + D * p.v0 + i * phi * np.log(S))
-    return np.real(np.exp(-i * phi * np.log(K)) * f / (i * phi))
-
-
-def heston_price(S, K, T, r, q, params: "HestonParams", option_type) -> float:
-    """European option price under the Heston model via Gauss-Legendre quadrature."""
-    is_call = OptionType.parse(option_type) is OptionType.CALL
-    S = float(S); K = float(K); T = float(T)
-    if T <= 0:
-        return max(S - K, 0.0) if is_call else max(K - S, 0.0)
-    phi = 0.5 * _HESTON_UMAX * (_HESTON_NODES + 1.0)   # map nodes to (0, UMAX]
-    w = 0.5 * _HESTON_UMAX * _HESTON_WEIGHTS
-    P1 = 0.5 + (1.0 / math.pi) * np.sum(w * _heston_integrand(phi, S, K, T, r, q, params, 1))
-    P2 = 0.5 + (1.0 / math.pi) * np.sum(w * _heston_integrand(phi, S, K, T, r, q, params, 2))
-    call = S * math.exp(-q * T) * P1 - K * math.exp(-r * T) * P2
-    if is_call:
-        price = call
-    else:  # put-call parity
-        price = call - S * math.exp(-q * T) + K * math.exp(-r * T)
-    return float(max(price, 0.0))
-
-
-def heston_iv(S, K, T, r, q, params: "HestonParams", option_type) -> float:
-    """Black-Scholes implied vol of the Heston price — i.e. the model's own smile point."""
-    px = heston_price(S, K, T, r, q, params, option_type)
-    return implied_vol(px, S, K, T, r, option_type, q, model="bs")
-
-
-def calibrate_heston(chain: OptionChain, r: float, q: float = 0.0, price: str = "mid",
-                     max_contracts: int = 120,
-                     init: "HestonParams | None" = None) -> "HestonParams":
-    """Least-squares calibration of Heston parameters to the chain's market implied vols.
-
-    Fitting IVs rather than raw prices is far better conditioned: it targets the surface
-    directly and puts every maturity/strike on a comparable scale. Only **OTM** quotes are
-    used (ITM last-trade prices are typically stale), restricted to moneyness 0.8–1.2 and
-    T > 1 week. Requires scipy. Raises ValueError if too few usable quotes remain.
+    Fits in total-variance space (w = iv²·T), which is the space SVI is linear-ish and well
+    conditioned in. Returns None when there are too few distinct points to identify the five
+    parameters, T is non-positive, or scipy fails to converge.
     """
-    if not _HAVE_SCIPY:
-        raise RuntimeError("Heston calibration requires scipy.")
+    k = np.asarray(k, dtype=float)
+    iv = np.asarray(iv, dtype=float)
+    good = np.isfinite(k) & np.isfinite(iv) & (iv > 0)
+    k, iv = k[good], iv[good]
+    if len(np.unique(k)) < _SVI_MIN_POINTS or not (T > 0):
+        return None
 
-    spot = chain.spot
-    if not (np.isfinite(spot) and spot > 0):
-        raise ValueError("Cannot calibrate Heston: underlying spot price is unavailable.")
+    w = iv ** 2 * T
+    k_lo, k_hi = float(k.min()), float(k.max())
+    span = max(k_hi - k_lo, 1e-3)
+    w_max = float(w.max())
 
-    T = chain.year_fractions()
-    recs = []
-    for c, t in zip(chain.contracts, T):
-        if t <= 7 / 365.25:
-            continue
-        m = c.strike / spot
-        if not (0.8 <= m <= 1.2):
-            continue
-        is_c = c.option_type is OptionType.CALL
-        if (is_c and c.strike < spot) or ((not is_c) and c.strike > spot):
-            continue  # keep OTM only
-        iv = implied_vol(c.price(price), spot, c.strike, t, r, c.option_type, q, "bs")
-        if np.isfinite(iv) and 0.01 < iv <= 3.0:
-            recs.append((c.strike, t, is_c, iv))
-    if len(recs) < 5:
-        raise ValueError("Not enough liquid OTM contracts with solvable IV to calibrate Heston.")
+    # Seeds: level near the variance floor, mild equity skew, minimum at the observed low.
+    a0 = max(float(w.min()) * 0.5, 1e-6)
+    m0 = float(k[np.argmin(w)])
+    lb = [-w_max,     1e-8, -0.999, k_lo - span, 1e-4]
+    ub = [2 * w_max,  10.0,  0.999, k_hi + span, 2.0]
+    p0 = [min(max(v, lo), hi) for v, lo, hi in
+          zip([a0, 0.1, -0.5, m0, 0.1], lb, ub)]
 
-    recs.sort(key=lambda x: (x[1], x[0]))
-    if len(recs) > max_contracts:  # even subsample to cap cost
-        idx = np.linspace(0, len(recs) - 1, max_contracts).round().astype(int)
-        recs = [recs[i] for i in idx]
+    def resid(p):
+        a, b, rho, m, sig = p
+        model = a + b * (rho * (k - m) + np.sqrt((k - m) ** 2 + sig ** 2))
+        return model - w
 
-    Ks = np.array([x[0] for x in recs])
-    Ts = np.array([x[1] for x in recs])
-    is_call = np.array([x[2] for x in recs])
-    mkt_iv = np.array([x[3] for x in recs])
+    try:
+        sol = _least_squares(resid, p0, bounds=(lb, ub), method="trf",
+                             max_nfev=2000, xtol=1e-10, ftol=1e-10)
+    except Exception:
+        return None
 
-    if init is None:
-        v_seed = float(np.clip(np.median(mkt_iv) ** 2, 1e-3, 1.0))
-        init = HestonParams(v0=v_seed, kappa=2.0, theta=v_seed, sigma=0.5, rho=-0.6)
-    x0 = [init.v0, init.kappa, init.theta, init.sigma, init.rho]
-    lb = [1e-4, 1e-2, 1e-4, 1e-2, -0.99]
-    ub = [1.0, 10.0, 1.0, 3.0, 0.99]
-
-    def resid(x):
-        p = HestonParams(*x)
-        model = np.array([
-            heston_iv(spot, k, t, r, q, p, OptionType.CALL if c else OptionType.PUT)
-            for k, t, c in zip(Ks, Ts, is_call)
-        ])
-        # Penalize parameter sets whose price can't be inverted rather than failing.
-        model = np.where(np.isfinite(model), model, mkt_iv + 1.0)
-        return model - mkt_iv
-
-    sol = _least_squares(resid, x0, bounds=(lb, ub), method="trf",
-                         max_nfev=200, xtol=1e-8, ftol=1e-8)
-    rmse = float(np.sqrt(np.mean(np.asarray(sol.fun) ** 2)))
-    return HestonParams(*sol.x, rmse=rmse)
+    params = SVIParams(*sol.x, T=float(T))
+    params.rmse = float(np.sqrt(np.nanmean((params.iv(k) - iv) ** 2)))
+    return params
 
 
 # ── Implied-volatility surface ────────────────────────────────────────────────
@@ -765,22 +582,29 @@ def calibrate_heston(chain: OptionChain, r: float, q: float = 0.0, price: str = 
 class IVSurface:
     """Reconstructed IV surface for one underlying.
 
+    The X-axis is **forward log-moneyness** k = ln(K / F), where F = S·e^{(r−q)T} is the
+    per-contract forward — so k = ln(K/spot) − (r−q)·T. The at-the-forward point is k = 0 for
+    every expiry, which stacks the smiles vertically instead of letting them drift with r, q,
+    and T (as a spot-based K/S axis would).
+
     `points` is the finite-IV cloud used for smile / term-structure / grid views.
     `iv_df` is the full per-contract table (every contract, incl. IV + BS Greeks) used
-    for display. In "heston" mode the IVs are the *model* IVs of the calibrated surface;
-    in "bs" mode they are inverted directly from market prices.
+    for display. IVs are inverted directly from market prices via Black-Scholes.
+
+    Each expiry slice is fit with a **raw-SVI** smile (`svi`, one `SVIParams` per expiry),
+    so smile / ATM / skew / surface queries evaluate a smooth, arbitrage-aware curve rather
+    than linearly interpolating the raw quote cloud. Interpolation across maturities is done
+    in total-variance space between the two bracketing SVI slices.
     """
 
     underlying: str
     spot: float
-    points: pd.DataFrame  # columns: expiry, T, strike, moneyness, option_type, iv
-    use_moneyness: bool = True
+    points: pd.DataFrame  # columns: expiry, T, strike, log_moneyness, option_type, iv
     iv_df: pd.DataFrame | None = None
-    heston_params: "HestonParams | None" = None
+    svi: dict[pd.Timestamp, SVIParams] = field(default_factory=dict)
 
     @classmethod
     def from_chain(cls, chain: OptionChain, r: float, q: float = 0.0,
-                   moneyness: bool = True, model: str = "bs",
                    price: str = "mid") -> "IVSurface":
         spot = chain.spot
         T = chain.year_fractions()
@@ -790,28 +614,23 @@ class IVSurface:
         n = len(chain.contracts)
         ivs = np.full(n, np.nan)
         statuses = ["ok"] * n
-        heston_params = None
 
-        if model == "heston":
-            heston_params = calibrate_heston(chain, r, q, price)
-            for i, (c, t) in enumerate(zip(chain.contracts, T)):
-                if t <= 0:
-                    statuses[i] = "expired"
-                    continue
-                hp = heston_price(spot, c.strike, t, r, q, heston_params, c.option_type)
-                ivs[i], statuses[i] = implied_vol_detail(
-                    hp, spot, c.strike, t, r, c.option_type, q, "bs")
-        else:  # "bs": invert market prices contract by contract
-            for i, (c, t) in enumerate(zip(chain.contracts, T)):
-                S = c.underlying_price if np.isfinite(c.underlying_price) else spot
-                ivs[i], statuses[i] = implied_vol_detail(
-                    c.price(price), S, c.strike, t, r, c.option_type, q, "bs")
+        # Invert market prices contract by contract.
+        for i, (c, t) in enumerate(zip(chain.contracts, T)):
+            S = c.underlying_price if np.isfinite(c.underlying_price) else spot
+            ivs[i], statuses[i] = implied_vol_detail(
+                c.price(price), S, c.strike, t, r, c.option_type, q)
 
         base["iv"] = ivs
         base["iv_status"] = statuses
-        base["moneyness"] = base["strike"] / spot if np.isfinite(spot) and spot > 0 else np.nan
+        # Forward log-moneyness: k = ln(K/F) = ln(K/spot) − (r−q)·T. Baked in at build time so
+        # every downstream view (ATM at k=0, skew wings) reads straight off the column.
+        if np.isfinite(spot) and spot > 0:
+            base["log_moneyness"] = np.log(base["strike"] / spot) - (r - q) * base["T"]
+        else:
+            base["log_moneyness"] = np.nan
 
-        # BS Greeks at the reconstructed IV (consistent across both modes).
+        # BS Greeks at the reconstructed IV.
         gcols = {k: np.full(n, np.nan) for k in ("delta", "gamma", "vega", "theta", "rho")}
         for i, (c, t, iv) in enumerate(zip(chain.contracts, T, ivs)):
             if np.isfinite(iv) and t > 0:
@@ -822,103 +641,140 @@ class IVSurface:
             base[k] = v
 
         pts = base[np.isfinite(base["iv"]) & (base["T"] > 0)][
-            ["expiry", "T", "strike", "moneyness", "option_type", "iv"]
+            ["expiry", "T", "strike", "log_moneyness", "option_type", "iv"]
         ].reset_index(drop=True)
-        return cls(underlying=chain.underlying, spot=spot, points=pts,
-                   use_moneyness=moneyness, iv_df=base, heston_params=heston_params)
+
+        # Fit one raw-SVI slice per expiry (call/put duplicates averaged at each k), eagerly
+        # so the surface arrives fully cooked. Slices too thin to identify are simply omitted;
+        # the affected views fall back to linear interpolation of the raw points.
+        svi: dict[pd.Timestamp, SVIParams] = {}
+        for exp in pts["expiry"].unique():
+            sub = pts[pts["expiry"] == exp]
+            grp = sub.groupby("log_moneyness")["iv"].mean()
+            fit = fit_svi(grp.index.to_numpy(), grp.to_numpy(), float(sub["T"].iloc[0]))
+            if fit is not None:
+                svi[pd.Timestamp(exp)] = fit
+
+        return cls(underlying=chain.underlying, spot=spot, points=pts, iv_df=base, svi=svi)
 
     def _x(self) -> np.ndarray:
-        return self.points["moneyness"].to_numpy() if self.use_moneyness \
-            else self.points["strike"].to_numpy()
+        return self.points["log_moneyness"].to_numpy()
 
     @property
     def x_label(self) -> str:
-        return "moneyness" if self.use_moneyness else "strike"
+        return "log-moneyness"
 
     @property
     def expiries(self) -> list[pd.Timestamp]:
         return sorted(self.points["expiry"].unique())
 
     def smile(self, expiry: pd.Timestamp | str) -> tuple[np.ndarray, np.ndarray]:
-        """(x, iv) for one expiry, averaged across call/put duplicates at each strike."""
+        """(k, iv) market points for one expiry, averaged across call/put duplicates at each
+        log-moneyness. This is the raw quote cloud; use `smile_curve` for the fitted SVI line."""
         exp = pd.Timestamp(expiry)
         sub = self.points[self.points["expiry"] == exp]
-        xcol = "moneyness" if self.use_moneyness else "strike"
-        grp = sub.groupby(xcol)["iv"].mean().sort_index()
+        grp = sub.groupby("log_moneyness")["iv"].mean().sort_index()
         return grp.index.to_numpy(), grp.to_numpy()
 
+    def smile_curve(self, expiry: pd.Timestamp | str, n: int = 100
+                    ) -> tuple[np.ndarray, np.ndarray]:
+        """Dense (k, iv) SVI curve spanning the expiry's observed strikes.
+
+        Returns empty arrays when that slice could not be fit (too few points)."""
+        exp = pd.Timestamp(expiry)
+        p = self.svi.get(exp)
+        sub = self.points[self.points["expiry"] == exp]
+        if p is None or sub.empty:
+            return np.array([]), np.array([])
+        ks = np.linspace(float(sub["log_moneyness"].min()),
+                         float(sub["log_moneyness"].max()), n)
+        return ks, p.iv(ks)
+
     def term_structure(self) -> tuple[np.ndarray, np.ndarray]:
-        """(T, ATM-iv) — one point per expiry, IV nearest to at-the-money."""
+        """(T, ATM-iv) — one point per expiry, SVI IV at the forward (log-moneyness 0)."""
         Ts, ivs = [], []
-        target = 1.0 if self.use_moneyness else self.spot
         for exp in self.expiries:
-            x, iv = self.smile(exp)
-            if len(x) == 0:
+            atm = self.atm_vol(exp)
+            if not np.isfinite(atm):
                 continue
-            atm_iv = float(np.interp(target, x, iv)) if len(x) > 1 \
-                else float(iv[np.argmin(np.abs(x - target))])
             Ts.append(float(self.points[self.points["expiry"] == exp]["T"].iloc[0]))
-            ivs.append(atm_iv)
+            ivs.append(atm)
         order = np.argsort(Ts)
         return np.array(Ts)[order], np.array(ivs)[order]
 
     def atm_vol(self, expiry: pd.Timestamp | str) -> float:
-        x, iv = self.smile(expiry)
+        """At-the-forward IV for one expiry — the SVI slice evaluated at log-moneyness 0."""
+        exp = pd.Timestamp(expiry)
+        p = self.svi.get(exp)
+        if p is not None:
+            return float(p.iv(0.0))
+        x, iv = self.smile(exp)  # fallback: linear on raw points
         if len(x) == 0:
             return np.nan
-        target = 1.0 if self.use_moneyness else self.spot
-        return float(np.interp(target, x, iv)) if len(x) > 1 else float(iv[0])
+        return float(np.interp(0.0, x, iv)) if len(x) > 1 else float(iv[0])
 
-    def skew(self, expiry: pd.Timestamp | str, lo: float = 0.9, hi: float = 1.1) -> float:
-        """IV(lo moneyness) − IV(hi moneyness) for one expiry (put-side minus call-side)."""
-        x, iv = self.smile(expiry)
+    def skew(self, expiry: pd.Timestamp | str, lo: float = -0.1, hi: float = 0.1) -> float:
+        """IV(lo) − IV(hi) across log-moneyness for one expiry (put-side minus call-side).
+
+        Evaluated on the SVI slice; defaults probe the ±0.1 wings. Positive means downside is
+        bid. Falls back to linear interpolation of the raw points when the slice is unfit.
+        """
+        exp = pd.Timestamp(expiry)
+        p = self.svi.get(exp)
+        if p is not None:
+            return float(p.iv(lo) - p.iv(hi))
+        x, iv = self.smile(exp)
         if len(x) < 2:
             return np.nan
-        if not self.use_moneyness:
-            lo, hi = lo * self.spot, hi * self.spot
         return float(np.interp(lo, x, iv) - np.interp(hi, x, iv))
 
+    def _slices(self) -> list[SVIParams]:
+        """Fitted SVI slices ordered by maturity."""
+        return sorted(self.svi.values(), key=lambda p: p.T)
+
+    def _iv_at(self, k: np.ndarray, T: float) -> np.ndarray:
+        """SVI IV over a log-moneyness array at maturity T.
+
+        Between the two bracketing slices, total variance w = σ²·T is linearly interpolated in
+        T (calendar-time interpolation) and converted back to vol; outside the fitted range the
+        nearest slice is held flat.
+        """
+        slices = self._slices()
+        if not slices:
+            return np.full(np.shape(k), np.nan)
+        if T <= slices[0].T:
+            return slices[0].iv(k)
+        if T >= slices[-1].T:
+            return slices[-1].iv(k)
+        lo = hi = slices[-1]
+        for i in range(1, len(slices)):
+            if slices[i].T >= T:
+                lo, hi = slices[i - 1], slices[i]
+                break
+        wl = np.maximum(lo.total_variance(k), 0.0)
+        wh = np.maximum(hi.total_variance(k), 0.0)
+        w = wl + (wh - wl) * (T - lo.T) / (hi.T - lo.T)
+        return np.sqrt(np.maximum(w, 0.0) / T)
+
     def interpolate(self, x: float, T: float) -> float:
-        """Interpolated IV at (strike-or-moneyness x, time-to-expiry T years)."""
-        px = self._x()
-        py = self.points["T"].to_numpy()
-        pz = self.points["iv"].to_numpy()
-        if len(pz) == 0:
-            return np.nan
-        if _HAVE_SCIPY:
-            val = _griddata((px, py), pz, (x, T), method="linear")
-            if val is None or not np.isfinite(val):
-                val = _griddata((px, py), pz, (x, T), method="nearest")
-            return float(val)
-        # numpy fallback: inverse-distance weighting over normalized coords.
-        xs = (px - px.min()) / (np.ptp(px) or 1.0)
-        ys = (py - py.min()) / (np.ptp(py) or 1.0)
-        xq = (x - px.min()) / (np.ptp(px) or 1.0)
-        yq = (T - py.min()) / (np.ptp(py) or 1.0)
-        d2 = (xs - xq) ** 2 + (ys - yq) ** 2
-        if d2.min() < 1e-12:
-            return float(pz[np.argmin(d2)])
-        w = 1.0 / d2
-        return float(np.sum(w * pz) / np.sum(w))
+        """SVI-model IV at (log-moneyness x, time-to-expiry T years)."""
+        return float(self._iv_at(np.array([x], dtype=float), float(T))[0])
 
     def grid(self, n: int = 40) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Mesh (X, Y, Z) over the point cloud for 3-D surface plotting.
+        """Mesh (X, Y, Z) of the fitted SVI surface for 3-D plotting.
 
-        X = strike/moneyness axis, Y = time-to-expiry (years), Z = interpolated IV.
+        X = log-moneyness axis, Y = time-to-expiry (years), Z = SVI IV (per-slice smile,
+        total-variance interpolation across maturities).
         """
         px = self._x()
-        py = self.points["T"].to_numpy()
-        pz = self.points["iv"].to_numpy()
-        if len(pz) == 0:
+        if len(self.svi) == 0 or len(px) == 0:
             empty = np.zeros((n, n))
             return empty, empty, empty
+        py = self.points["T"].to_numpy()
         xi = np.linspace(px.min(), px.max(), n)
         yi = np.linspace(py.min(), py.max(), n)
         X, Y = np.meshgrid(xi, yi)
-        if _HAVE_SCIPY:
-            Z = _griddata((px, py), pz, (X, Y), method="linear")
-            Zn = _griddata((px, py), pz, (X, Y), method="nearest")
-            Z = np.where(np.isfinite(Z), Z, Zn)
-        else:
-            Z = np.vectorize(lambda a, b: self.interpolate(a, b))(X, Y)
+        Z = np.empty_like(X)
+        for j in range(n):
+            Z[j, :] = self._iv_at(xi, float(yi[j]))
         return X, Y, Z

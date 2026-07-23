@@ -60,9 +60,10 @@ def sidebar_controls(symbol: str | None, api_key: str) -> dict:
     st.caption(f"Underlying: **{symbol}**")
 
     today = date.today()
+    one_month_ahead = today + timedelta(days=30)
     exp_range = st.date_input(
         "Expiry window",
-        value=(today, today + timedelta(days=180)),
+        value=(today, one_month_ahead),
         min_value=today,
         key="opt_expiry",
     )
@@ -70,15 +71,12 @@ def sidebar_controls(symbol: str | None, api_key: str) -> dict:
         d_from, d_to = exp_range
     else:  # user mid-selection: single date → treat as the upper bound
         d_from, d_to = today, (
-            exp_range if isinstance(exp_range, date) else today + timedelta(days=180)
+            exp_range if isinstance(exp_range, date) else one_month_ahead
         )
 
     _rc, _qc = st.columns(2)
     r_bps = _rc.number_input("Rate (bps)", value=400, step=25, min_value=0, key="opt_r")
     q_bps = _qc.number_input("Div. (bps)", value=0, step=25, min_value=0, key="opt_q")
-
-    x_axis = st.radio("Smile x-axis", ["moneyness", "strike"], horizontal=True,
-                      key="opt_xaxis")
 
     load = st.button(f"Load {symbol} chain", type="primary", use_container_width=True,
                      key="opt_load")
@@ -90,7 +88,6 @@ def sidebar_controls(symbol: str | None, api_key: str) -> dict:
         "max_dte": max((d_to - today).days, max((d_from - today).days, 0)),
         "r_bps": r_bps, "q_bps": q_bps,
         "r": r_bps / 1e4, "q": q_bps / 1e4,
-        "use_moneyness": x_axis == "moneyness",
         "load": load,
     }
 
@@ -130,7 +127,6 @@ def render_section(state: dict, api_key: str) -> dict | None:
     min_dte, max_dte = state["min_dte"], state["max_dte"]
     r, q = state["r"], state["q"]
     r_bps, q_bps = state["r_bps"], state["q_bps"]
-    use_moneyness = state["use_moneyness"]
 
     # ── Chain acquisition ────────────────────────────────────────────────────
     # Keyed by symbol: the picker switches underlyings without reloading the chain.
@@ -139,6 +135,12 @@ def render_section(state: dict, api_key: str) -> dict | None:
         st.session_state[chain_key] = load_chain_cached(
             symbol, min_dte=min_dte, max_dte=max_dte, api_key=api_key,
         )
+        # A reload brings fresh chain data, so every cached surface is now stale — including
+        # one a settings-change rerun may have just built from the *old* chain under the key
+        # this reload will land on. Drop them all so the surface re-fits from the new chain
+        # instead of returning that stale entry.
+        for _k in [k for k in st.session_state if str(k).startswith("_surf_")]:
+            del st.session_state[_k]
     chain = st.session_state.get(chain_key)
 
     if chain is None or not chain.contracts:
@@ -161,7 +163,7 @@ def render_section(state: dict, api_key: str) -> dict | None:
     # ── Reconstruct surface (cached by parameter signature) ──────────────────
     surf_key = (
         f"_surf_{chain.underlying}_{min_dte}_{max_dte}"
-        f"_{r_bps}_{q_bps}_{use_moneyness}"
+        f"_{r_bps}_{q_bps}"
     )
     if surf_key in st.session_state:
         surface = st.session_state[surf_key]
@@ -172,7 +174,7 @@ def render_section(state: dict, api_key: str) -> dict | None:
                 # offers, so the surface always reflects market quotes rather than a
                 # fitted model, and never a stale last-traded print.
                 surface = IVSurface.from_chain(
-                    chain, r=r, q=q, moneyness=use_moneyness, model="bs", price="mid",
+                    chain, r=r, q=q, price="mid",
                 )
             st.session_state[surf_key] = surface
         except (ValueError, RuntimeError) as e:
@@ -191,9 +193,10 @@ def render_section(state: dict, api_key: str) -> dict | None:
         {"label": "Spot", "value": f"{chain.spot:,.2f}" if pd.notna(chain.spot) else "—",
          "help": "Live underlying price from the option feed — not the last bar close."},
         {"label": "Front ATM IV", "value": f"{_atm * 100:.1f}%" if pd.notna(_atm) else "—",
-         "help": "At-the-money implied vol of the nearest expiry."},
-        {"label": "Front skew 90/110", "value": f"{_skew * 100:.1f}%" if pd.notna(_skew) else "—",
-         "help": "Put-side minus call-side IV. Positive means downside is bid."},
+         "help": "At-the-forward implied vol (log-moneyness 0) of the nearest expiry."},
+        {"label": "Front skew ±0.10", "value": f"{_skew * 100:.1f}%" if pd.notna(_skew) else "—",
+         "help": "IV at −0.1 log-moneyness minus IV at +0.1 (put-side minus call-side). "
+                 "Positive means downside is bid."},
         {"label": "Contracts", "value": f"{n_total:,}",
          "delta": f"−{n_expired} expired" if n_expired else None,
          "help": "Live contracts in the requested expiry window."},
@@ -208,6 +211,10 @@ def render_section(state: dict, api_key: str) -> dict | None:
         if len(_unsolved):
             _reasons = ", ".join(f"{n} {why}" for why, n in _unsolved.value_counts().items())
             _quality += f" Skipped — {_reasons} (see `iv_status` in the chain table)."
+    if surface.svi:
+        _rmse = pd.Series([p.rmse for p in surface.svi.values()]).median()
+        _quality += (f" SVI smiles fit on {len(surface.svi)}/{len(surface.expiries)} expiries "
+                     f"(median fit error {_rmse * 100:.2f} vol pts).")
     st.caption(_quality)
 
     # ── Surface + term structure ─────────────────────────────────────────────

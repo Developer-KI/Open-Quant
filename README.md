@@ -75,8 +75,7 @@ src/
 │   ├── universe.py              # Universe — holds OHLCV + L2 + funding per symbol
 │   ├── feeds.py                 # BaseFeed, BaseBarBuilder base classes
 │   ├── parser.py                # trades_to_ohlcv, l2_to_orderbook, funding helpers
-│   └── derivatives.py           # OptionChain, Black-Scholes / binomial, IV, Greeks,
-│                                # Heston calibration, IVSurface
+│   └── derivatives.py           # OptionChain, Black-Scholes, IV, Greeks, SVI, IVSurface
 │
 ├── strategy/                    # Pure-Python strategy framework
 │   ├── base.py                  # Strategy, StrategyContext, PortfolioTarget, registries
@@ -809,11 +808,10 @@ Market tab. It has no dependency on the backtester or the live engine.
 ```python
 from core.derivatives import (
     OptionChain, OptionType,
-    black_scholes_price, binomial_price,
+    black_scholes_price,
     implied_vol, implied_vol_chain,
     greeks, greeks_chain,
-    HestonParams, heston_price, calibrate_heston,
-    IVSurface,
+    IVSurface, SVIParams, fit_svi,
 )
 
 # Build a chain from provider rows (LSE `client.options()` output, field-name tolerant)
@@ -821,29 +819,32 @@ chain = OptionChain.from_records(rows, underlying="SPY").drop_expired()
 chain.expiries, chain.strikes, chain.spot
 chain.for_expiry("2026-09-18")
 
-# Pricing — European (Black-Scholes) or American (binomial, 200 steps by default)
+# Pricing — European Black-Scholes (continuous dividend yield q)
 black_scholes_price(S=500, K=510, T=0.25, r=0.04, sigma=0.2, option_type="call")
-binomial_price(S=500, K=510, T=0.25, r=0.04, sigma=0.2, option_type="put", american=True)
 
-# Implied vol — bracketed solve, model="bs" or "binomial" for American
+# Implied vol — Newton with a bracketed fallback, no arbitrary vol cap
 implied_vol(price=12.5, S=500, K=510, T=0.25, r=0.04, option_type="call")
 iv_df = implied_vol_chain(chain, r=0.04)
 
-# Greeks — analytic under BS, finite-difference under the binomial model
+# Greeks — analytic under Black-Scholes
 g = greeks(S=500, K=510, T=0.25, r=0.04, sigma=0.2, option_type="call")
 g.as_dict()          # delta, gamma, vega, theta, rho
 
-# Stochastic vol — least-squares Heston calibration against the chain
-params = calibrate_heston(chain, r=0.04)
-params.feller         # 2κθ − ξ² ; negative means the variance process can hit zero
+# IV surface — X-axis is forward log-moneyness k = ln(K/F), F = S·e^((r-q)T), ATM at k=0.
+# Each expiry slice is fit with a raw-SVI smile (Gatheral), so smile/ATM/skew/surface
+# queries evaluate a smooth arbitrage-aware curve instead of interpolating the raw cloud.
+surf = IVSurface.from_chain(chain, r=0.04)
+surf.svi                              # {expiry: SVIParams(a,b,rho,m,sigma,T,rmse)}
+surf.smile("2026-09-18")              # (k, iv) raw market points
+surf.smile_curve("2026-09-18")        # (k, iv) dense fitted SVI curve
+surf.term_structure()                 # (T, at-the-forward iv)
+surf.atm_vol("2026-09-18")            # SVI iv at k=0
+surf.skew("2026-09-18", lo=-0.1, hi=0.1)   # IV(-0.1) - IV(+0.1), put-side minus call-side
+surf.interpolate(x=0.02, T=0.25)      # SVI iv; total-variance interpolation across maturities
 
-# IV surface — smile, term structure, skew, interpolation, meshgrid
-surf = IVSurface.from_chain(chain, r=0.04, model="bs", moneyness=True)
-surf.smile("2026-09-18")
-surf.term_structure()
-surf.atm_vol("2026-09-18")
-surf.skew("2026-09-18", lo=0.9, hi=1.1)
-surf.interpolate(x=1.02, T=0.25)
+# Fit a single slice directly (log-moneyness, IV, maturity)
+params = fit_svi(k=[-0.2, -0.1, 0.0, 0.1, 0.2], iv=[0.28, 0.24, 0.22, 0.23, 0.25], T=0.25)
+params.iv(0.0)                        # ATM vol from the fitted slice
 ```
 
 ---

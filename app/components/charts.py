@@ -700,18 +700,29 @@ def plot_features(
 # ── Options / IV surface charts ───────────────────────────────────────────────
 
 def iv_smile_chart(surface, expiries=None, height: int = 420) -> go.Figure:
-    """Implied-vol smile: IV vs strike/moneyness, one line per expiry."""
+    """Implied-vol smile: market IV points (markers) with the fitted SVI curve (line),
+    one colour per expiry, against log-moneyness."""
     expiries = expiries if expiries is not None else surface.expiries
     fig = go.Figure()
     for i, exp in enumerate(expiries):
         x, iv = surface.smile(exp)
         if len(x) == 0:
             continue
+        color = _OVERLAY_COLORS[i % len(_OVERLAY_COLORS)]
         label = pd.Timestamp(exp).strftime("%Y-%m-%d")
+        # Raw market quotes as markers.
         fig.add_trace(go.Scatter(
-            x=x, y=iv * 100.0, name=label, mode="lines+markers",
-            line=dict(color=_OVERLAY_COLORS[i % len(_OVERLAY_COLORS)], width=1.5),
+            x=x, y=iv * 100.0, name=label, mode="markers",
+            marker=dict(color=color, size=6),
         ))
+        # Smooth SVI fit as the connecting line (omitted when the slice was too thin to fit).
+        ck, civ = surface.smile_curve(exp)
+        if len(ck):
+            fig.add_trace(go.Scatter(
+                x=ck, y=civ * 100.0, name=f"{label} (SVI)", mode="lines",
+                line=dict(color=color, width=1.5), showlegend=False,
+                hoverinfo="skip",
+            ))
     fig.update_layout(
         template=_DARK, title="IV Smile", height=height,
         hovermode="x unified", margin=_MARGIN_MAIN, legend=_LEGEND_H,
@@ -743,7 +754,7 @@ def term_structure_chart(surface, height: int = 300) -> go.Figure:
 
 def iv_surface_chart(surface, n: int = 40, height: int = 560) -> go.Figure:
     """
-    3-D IV surface over the (strike/moneyness, time) grid.
+    3-D IV surface over the (log-moneyness, time) grid.
 
     Aspect and camera are set explicitly so the cube fills the frame — the plotly
     default leaves a band of empty space above it and clips the axis labels below.

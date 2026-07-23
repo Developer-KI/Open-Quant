@@ -16,6 +16,7 @@ Multi-asset:
 from __future__ import annotations
 
 import abc
+import copy
 
 import numpy as np
 import pandas as pd
@@ -182,6 +183,24 @@ class PerAssetStrategy(Strategy):
         super().__init__(**kwargs)
         self.strategies = strategies
 
+    @classmethod
+    def from_template(
+        cls, template: SingleAssetStrategy, symbols: list[str], **kwargs
+    ) -> "PerAssetStrategy":
+        """Fan a single-asset strategy out across a universe.
+
+        Deep-copies ``template`` once per symbol, rebinding each copy to its own
+        symbol, so a strategy written for one asset trades every asset in the
+        universe independently. Used by the backtester to auto-wrap a
+        SingleAssetStrategy that is run on a multi-asset universe.
+        """
+        strategies: dict[str, SingleAssetStrategy] = {}
+        for sym in symbols:
+            s = copy.deepcopy(template)
+            s.symbol = sym
+            strategies[sym] = s
+        return cls(strategies=strategies, **kwargs)
+
     @property
     def params(self) -> dict:
         return {sym: s.params for sym, s in self.strategies.items()}
@@ -197,7 +216,15 @@ class PerAssetStrategy(Strategy):
         n_assets = len(self.strategies)
         for sym, s in self.strategies.items():
             data = ctx.universe.ohlcv(sym)
-            alloc = s.bar(data, ctx.bar_idx)
+            # ctx.bar_idx is a position on the (possibly shorter) common index; map it
+            # back to this symbol's own row by timestamp so assets with ragged histories
+            # stay bar-aligned. Falls back to bar_idx when timestamps line up 1:1.
+            idx = ctx.bar_idx
+            if ctx.timestamp is not None:
+                loc = data.index.get_indexer([ctx.timestamp])[0]
+                if loc >= 0:
+                    idx = loc
+            alloc = s.bar(data, idx)
             target[sym] = Allocation(
                 side=alloc.side,
                 weight=alloc.weight / max(n_assets, 1),
@@ -209,6 +236,15 @@ class PerAssetStrategy(Strategy):
 
     def generate_all(self, universe):
         n_assets = len(self.strategies)
+        # The engine drives the vectorised path over the universe's common (intersection)
+        # index, so every symbol's arrays must share that length. Child single-asset
+        # strategies emit arrays aligned to their own (possibly longer) bar count, so
+        # realign each onto the common index by timestamp when assets are ragged.
+        multi = len(universe.symbols) > 1
+        index = universe.common_index() if multi else None
+        if index is not None and len(index) == 0:
+            index = None
+
         sides_all = {}
         weights_all = {}
         reasons_all = {}
@@ -218,11 +254,27 @@ class PerAssetStrategy(Strategy):
             batch = s.generate_all(universe)
             if batch is None:
                 return None
-            sides_all[sym]       = batch[0][sym]
-            weights_all[sym]     = batch[1][sym] / max(n_assets, 1)
-            reasons_all[sym]     = [f"[{sym}] {r}" for r in batch[2][sym]]
-            metas_all[sym]       = batch[3][sym]
-            confidences_all[sym] = batch[4][sym] if len(batch) > 4 else np.zeros(len(batch[0][sym]))
+            sides   = batch[0][sym]
+            weights = batch[1][sym] / max(n_assets, 1)
+            reasons = batch[2][sym]
+            metas   = batch[3][sym]
+            confs   = batch[4][sym] if len(batch) > 4 else np.zeros(len(sides))
+
+            if index is not None and len(sides) != len(index):
+                locs  = universe.ohlcv(sym).index.get_indexer(index)
+                valid = locs >= 0
+                g     = np.where(valid, locs, 0)
+                sides   = np.where(valid, sides[g], 0).astype(np.int8)
+                weights = np.where(valid, weights[g], 0.0)
+                confs   = np.where(valid, confs[g], 0.0)
+                reasons = [reasons[gi] if v else "" for gi, v in zip(g, valid)]
+                metas   = [metas[gi] if v else {} for gi, v in zip(g, valid)]
+
+            sides_all[sym]       = sides
+            weights_all[sym]     = weights
+            reasons_all[sym]     = [f"[{sym}] {r}" for r in reasons]
+            metas_all[sym]       = metas
+            confidences_all[sym] = confs
         return sides_all, weights_all, reasons_all, metas_all, confidences_all
 
 

@@ -289,7 +289,7 @@ with st.sidebar:
         st.divider()
         _sb("Indicators")
 
-        overlay_ema = st.checkbox("EMA", value=True, key="ema")
+        overlay_ema = st.checkbox("EMA", value=False, key="ema")
         if overlay_ema:
             _ei1, _ei2 = st.columns(2)
             ema_fast = int(_ei1.number_input("Fast", value=12, step=1, min_value=2, key="ef"))
@@ -305,7 +305,7 @@ with st.sidebar:
             bb_window = int(_bi1.number_input("Window", value=20,  step=1,   min_value=5,   key="bbw"))
             bb_std    =     _bi2.number_input("Std",    value=2.0, step=0.5, min_value=0.5, key="bbs")
 
-        show_rsi = st.checkbox("RSI", value=True, key="rsi")
+        show_rsi = st.checkbox("RSI", value=False, key="rsi")
         if show_rsi:
             rsi_period = int(st.number_input("RSI period", value=14, step=1, min_value=2, key="rp"))
 
